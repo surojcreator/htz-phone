@@ -97,7 +97,15 @@ export class HtzClient {
     if (cookie) headers.Cookie = cookie;
 
     const res = await withTimeout(
-      fetch(url, { method: 'POST', headers, body: JSON.stringify(body) }),
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        // React Native only attaches/stores cookies when the request opts in.
+        // Without this the login succeeds but the follow-up call has no session
+        // (the app API answers 150 "must be logged in").
+        credentials: 'include',
+      }),
       25000,
     );
     this.absorb(res);
@@ -114,6 +122,7 @@ export class HtzClient {
     const pageRes = await withTimeout(
       fetch(`${WEB}/login`, {
         headers: this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {},
+        credentials: 'include',
       }),
       25000,
     );
@@ -143,6 +152,7 @@ export class HtzClient {
           ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
         },
         body: form.toString(),
+        credentials: 'include',
       }),
       25000,
     );
@@ -156,6 +166,7 @@ export class HtzClient {
     const res = await withTimeout(
       fetch(`${WEB}/support_page`, {
         headers: this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {},
+        credentials: 'include',
       }),
       25000,
     );
@@ -247,10 +258,28 @@ export class HtzClient {
 
   /** App API partial update — only `phone` is sent, so nothing else is touched. */
   async appSetPhone(phone: string): Promise<void> {
-    const res = await this.postJson(`${APP_API}editUserInformation/`, { phone });
-    if (res?.status !== 1) {
-      const msg = res?.err?.content || JSON.stringify(res).slice(0, 160);
-      throw new Error(`edit failed: ${msg}`);
+    const write = async () => {
+      const res = await this.postJson(`${APP_API}editUserInformation/`, { phone });
+      if (res?.status !== 1) {
+        const err = res?.err ?? {};
+        const message = err?.content || JSON.stringify(res).slice(0, 160);
+        const authErr = new Error(message) as Error & { code?: number };
+        authErr.code = typeof err?.id === 'number' ? err.id : undefined;
+        throw authErr;
+      }
+    };
+
+    try {
+      await write();
+    } catch (e: any) {
+      // 150 = "to perform this action you must be logged in": the session
+      // cookie didn't travel with the request. Re-authenticate once and retry.
+      if (e?.code === 150) {
+        await this.appLogin();
+        await write();
+        return;
+      }
+      throw e;
     }
   }
 }

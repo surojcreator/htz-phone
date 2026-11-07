@@ -2,7 +2,7 @@
   "expo": {
     "name": "Htz Phone",
     "slug": "htz-phone",
-    "version": "1.0.9",
+    "version": "1.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "scheme": "htzphone",
@@ -19,9 +19,12 @@
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": false
-        }
+        },
+        "UIBackgroundModes": [
+          "audio"
+        ]
       },
-      "buildNumber": "5"
+      "buildNumber": "6"
     },
     "android": {
       "package": "com.htzphone.app",
@@ -29,7 +32,8 @@
         "backgroundColor": "#0b1220"
       },
       "permissions": [
-        "android.permission.INTERNET"
+        "android.permission.INTERNET",
+        "android.permission.WAKE_LOCK"
       ]
     },
     "web": {

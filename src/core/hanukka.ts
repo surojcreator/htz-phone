@@ -31,9 +31,36 @@ export type HanukkaOptions = {
   payment?: string;        // default '2' (two payments)
   payOption?: string;      // forced 'new_card'
   dryRun?: boolean;
+  /** Carry the logged-in session, item page and checkout metadata between orders. */
+  session?: HanukkaSession;
+  /** Ignore the cache and reload the login / item / checkout pages once. */
+  forceReload?: boolean;
   shouldStop?: () => boolean;
   log?: (line: string) => void;
 };
+
+/**
+ * Per-runner state that survives between orders.
+ *
+ * Repeating a purchase does not change who is logged in, which project the
+ * wallet belongs to, which variants the item has, or who the supplier is — so
+ * reloading those pages for every order is pure latency (and extra logins are
+ * what the site rate-limits). One runner, one session.
+ */
+export type HanukkaSession = {
+  loggedIn: boolean;
+  proj?: string;
+  item?: string;
+  variants?: Variant[];
+  title?: string;
+  allowance?: number;
+  supplier?: string;
+  payment?: string;
+};
+
+export function newHanukkaSession(): HanukkaSession {
+  return { loggedIn: false };
+}
 
 export type HanukkaResult = {
   ok: boolean;
@@ -179,9 +206,22 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     return { ok: false, steps, variants, error: `stopped before ${where}` };
   };
 
+  const sess = opts.session;
+  const force = !!opts.forceReload;
+  const sessionReady = !!sess && sess.loggedIn && !force;
+
   try {
-    await client.webLogin();
-    add('web login', true, client.email);
+    // ---- session -------------------------------------------------------
+    // An order does not invalidate the login, so repeats reuse it. Reloading
+    // /login for every order costs a round-trip *and* counts against the
+    // site's login rate limit.
+    if (sessionReady) {
+      add('web login', true, `reused session (${client.email})`);
+    } else {
+      await client.webLogin();
+      if (sess) sess.loggedIn = true;
+      add('web login', true, client.email);
+    }
     if (stopped()) return abort('wallet sign-in');
 
     // ---- wallet sign-in for the item's project -------------------------
@@ -197,45 +237,68 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       return (j && j.href) || null;
     };
 
-    let href = await signIn(proj);
-    if (!href) {
-      add('wallet sign-in', false, 'PRO² quick sign-in refused (account not eligible, or TZ sign-in required)');
-      return { ok: false, steps, variants: [], error: 'wallet sign-in refused' };
-    }
-    add('wallet sign-in', true, `proj ${proj}`);
-
     const cardUrl = (h: string | null) => {
       let u = h && /wallet_attraction_item-com\//.test(h) ? h : `/wallet_attraction_item-com/${item}`;
       if (!/^https?:/i.test(u) && !u.startsWith('/')) u = '/' + u;
       return u;
     };
 
-    let html = await client.webGet(cardUrl(href));
-    const pageProj = (html.match(/proj_id=(\d+)/) || html.match(/wallet_attractions_sale\/(\d+)/) || [])[1];
-    if (pageProj && pageProj !== proj) {
-      const href2 = await signIn(pageProj);
-      if (!href2) {
-        add('wallet sign-in (item project)', false, `proj ${pageProj} refused`);
-        return { ok: false, steps, variants: [], error: 'sign-in refused for the item project' };
+    // Item identity is (project, item): the variants, allowance and supplier
+    // only change when one of those changes.
+    const cacheHit = sessionReady && sess!.proj === proj && sess!.item === item && !!sess!.variants?.length;
+
+    let variants: Variant[] = [];
+    let title = '';
+    let allowance = 0;
+
+    if (cacheHit) {
+      variants = sess!.variants!;
+      title = sess!.title || '';
+      allowance = sess!.allowance || 0;
+      add('item', true, `${title || item} · ${variants.length} variant(s) · cached`);
+    } else {
+      const href = await signIn(proj);
+      if (!href) {
+        add('wallet sign-in', false, 'PRO² quick sign-in refused (account not eligible, or TZ sign-in required)');
+        return { ok: false, steps, variants: [], error: 'wallet sign-in refused' };
       }
-      proj = pageProj;
-      html = await client.webGet(cardUrl(href2));
-      add('wallet sign-in (item project)', true, `proj ${proj}`);
-    }
+      add('wallet sign-in', true, `proj ${proj}`);
 
-    if (!/data-collected_id=["']|class="item_title"/.test(html)) {
-      add('item page', false, `did not render (${html.length} B)`);
-      return { ok: false, steps, variants: [], error: 'item page did not render' };
-    }
-    if (/אין לך זכאות/.test(html)) {
-      add('eligibility', false, 'PRO² gate closed — this account has no shop eligibility');
-      return { ok: false, steps, variants: [], error: 'no PRO² eligibility on this account' };
-    }
+      let html = await client.webGet(cardUrl(href));
+      const pageProj = (html.match(/proj_id=(\d+)/) || html.match(/wallet_attractions_sale\/(\d+)/) || [])[1];
+      if (pageProj && pageProj !== proj) {
+        const href2 = await signIn(pageProj);
+        if (!href2) {
+          add('wallet sign-in (item project)', false, `proj ${pageProj} refused`);
+          return { ok: false, steps, variants: [], error: 'sign-in refused for the item project' };
+        }
+        proj = pageProj;
+        html = await client.webGet(cardUrl(href2));
+        add('wallet sign-in (item project)', true, `proj ${proj}`);
+      }
 
-    const title = text((html.match(/class="item_title"[^>]*>([\s\S]{0,160}?)<\//) || [])[1] || '');
-    variants = parseVariants(html);
-    const allowance = Number((html.match(/data-max_no_points=['"](\d+)['"]/) || html.match(/data-max=['"](\d+)['"]/) || [])[1] || 0);
-    add('item', true, `${title || item} · ${variants.length} variant(s)${allowance ? ` · allowance ${allowance}` : ''}`);
+      if (!/data-collected_id=["']|class="item_title"/.test(html)) {
+        add('item page', false, `did not render (${html.length} B)`);
+        return { ok: false, steps, variants: [], error: 'item page did not render' };
+      }
+      if (/אין לך זכאות/.test(html)) {
+        add('eligibility', false, 'PRO² gate closed — this account has no shop eligibility');
+        return { ok: false, steps, variants: [], error: 'no PRO² eligibility on this account' };
+      }
+
+      title = text((html.match(/class="item_title"[^>]*>([\s\S]{0,160}?)<\//) || [])[1] || '');
+      variants = parseVariants(html);
+      allowance = Number((html.match(/data-max_no_points=['"](\d+)['"]/) || html.match(/data-max=['"](\d+)['"]/) || [])[1] || 0);
+      add('item', true, `${title || item} · ${variants.length} variant(s)${allowance ? ` · allowance ${allowance}` : ''}`);
+
+      if (sess) {
+        sess.proj = proj;
+        sess.item = item;
+        sess.variants = variants;
+        sess.title = title;
+        sess.allowance = allowance;
+      }
+    }
 
     const lines = buildLines(variants, opts.collected, opts.qty);
     const wanted = lines.filter((l) => l.qty > 0);
@@ -249,13 +312,26 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     if (stopped()) return abort('cart add');
 
     // ---- seed the cart ------------------------------------------------
-    await client.webAjax("cart_service", "empty_cart", {}, `/wallet_attraction_item/${item}`, "act");
-    const addRes = await client.webAjax('cart_service', 'add_wallet_attraction', {
-      is_quick: '1',
-      is_collected: variants.length ? '1' : '0',
-      item_id: item,
-      collected_arr: JSON.stringify(wanted.map((l) => ({ collectedId: l.id, quantity: l.qty }))),
-    }, `/wallet_attraction_item/${item}`, 'act');
+    const addToCart = async () => {
+      await client.webAjax("cart_service", "empty_cart", {}, `/wallet_attraction_item/${item}`, "act");
+      return client.webAjax('cart_service', 'add_wallet_attraction', {
+        is_quick: '1',
+        is_collected: variants.length ? '1' : '0',
+        item_id: item,
+        collected_arr: JSON.stringify(wanted.map((l) => ({ collectedId: l.id, quantity: l.qty }))),
+      }, `/wallet_attraction_item/${item}`, 'act');
+    };
+
+    let addRes = await addToCart();
+    // A reused session can have lapsed while the app sat idle: the site answers
+    // "must be logged in". Re-authenticate and retry the cart once.
+    if (addRes && addRes.status !== 1 && sessionReady && /מחובר|התחבר|login/i.test(errText(addRes))) {
+      log('… session lapsed, logging in again');
+      await client.webLogin();
+      await signIn(proj);
+      addRes = await addToCart();
+      add('web login', true, 're-authenticated');
+    }
     const amount = addRes && addRes.data && Number(addRes.data.amount || 0);
     if (!addRes || addRes.status !== 1) {
       const detail = errText(addRes) || `status ${addRes?.status ?? '?'}: ${JSON.stringify(addRes).slice(0, 120)}`;
@@ -269,10 +345,18 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     add('cart add', true, `${amount} unit(s)`);
 
     // ---- checkout page: supplier + payment options ---------------------
-    const co = await client.webGet('/checkout2_wallet');
-    const supplier = (co.match(/name="preferredPaymentsSelectBox\[(\d+)\]"/) || [])[1] || '2452';
-    const payment = '2';   // two payments — the option the site checks by default
-    add('checkout page', true, `supplier ${supplier} · payment ${payment}`);
+    // Supplier is a property of the item, not of this order.
+    let supplier = !force && sess?.supplier ? sess.supplier : '';
+    if (supplier) {
+      add('checkout page', true, `supplier ${supplier} · cached`);
+    } else {
+      const co = await client.webGet('/checkout2_wallet');
+      supplier = (co.match(/name="preferredPaymentsSelectBox\[(\d+)\]"/) || [])[1] || '2452';
+      if (sess) sess.supplier = supplier;
+      add('checkout page', true, `supplier ${supplier} · payment 2`);
+    }
+    const payment = opts.payment || sess?.payment || '2';   // two payments — the option the site checks by default
+    if (sess) sess.payment = payment;
 
     const payBody = buildPayBody({
       phone: opts.phone,

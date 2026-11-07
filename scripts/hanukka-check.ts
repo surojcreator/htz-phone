@@ -7,7 +7,7 @@
  * Dry run prints the pay_order_wallet body and never pays.
  */
 import { HtzClient } from '../src/core/api';
-import { buildPayBody, parseVariants, runHanukka } from '../src/core/hanukka';
+import { buildPayBody, newHanukkaSession, parseVariants, runHanukka } from '../src/core/hanukka';
 
 function arg(name: string, fallback = ''): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -23,14 +23,31 @@ function arg(name: string, fallback = ''): string {
   }
 
   const client = new HtzClient(email, password);
-  const res = await runHanukka(client, {
+  const session = newHanukkaSession();
+  const reps = Math.max(1, parseInt(arg('reps', '1'), 10) || 1);
+  let res = await runHanukka(client, {
     itemId: arg('item', '166122'),
     qty: parseInt(arg('qty', '4'), 10) || 4,
     phone: arg('phone', '0555073599'),
     collected: arg('collect', undefined as unknown as string) || undefined,
     dryRun: process.argv.includes('--dry-run'),
+    session,
     log: (l) => console.log('  ' + l),
   });
+
+  // repeats reuse the session — the second pass must not log in again
+  for (let i = 2; i <= reps && res.ok; i++) {
+    console.log(`\n  === repeat ${i}/${reps} ===`);
+    res = await runHanukka(client, {
+      itemId: arg('item', '166122'),
+      qty: parseInt(arg('qty', '4'), 10) || 4,
+      phone: arg('phone', '0555073599'),
+      collected: arg('collect', undefined as unknown as string) || undefined,
+      dryRun: process.argv.includes('--dry-run'),
+      session,
+      log: (l) => console.log('  ' + l),
+    });
+  }
 
   if (res.variants.length) {
     console.log('\n  variants:');

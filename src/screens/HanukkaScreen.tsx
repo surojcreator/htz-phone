@@ -14,7 +14,8 @@ import {
 } from 'react-native';
 
 import { HtzClient } from '../core/api';
-import { HANUKKA_ITEMS, HanukkaResult, runHanukka } from '../core/hanukka';
+import { HANUKKA_ITEMS, HanukkaResult, newHanukkaSession, runHanukka } from '../core/hanukka';
+import { startKeepAlive, stopKeepAlive } from '../core/keepAlive';
 import { checkInt, checkPhone, checkQty } from '../core/format';
 import { theme } from '../ui/theme';
 import { useCreds } from '../ui/credentials';
@@ -29,6 +30,8 @@ export default function HanukkaScreen() {
   const [repeats, setRepeats] = useState('1');
   const [delay, setDelay] = useState('1200');
   const [dryRun, setDryRun] = useState(true);
+  const [reload, setReload] = useState(false);
+  const [background, setBackground] = useState(true);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
   const [lines, setLines] = useState<string[]>([]);
@@ -46,8 +49,16 @@ export default function HanukkaScreen() {
     const push = (l: string) => setLines((prev) => (prev.length > 400 ? [...prev.slice(-400), l] : [...prev, l]));
     const total = Math.min(50, Math.max(1, checkInt(repeats, 1, 1)));
     const gap = checkInt(delay, 1200, 0);
+    let keptAlive = false;
     try {
+      if (background) {
+        keptAlive = await startKeepAlive();
+        push(keptAlive
+          ? '· background keep-alive on — you can leave the app'
+          : '· background keep-alive unavailable; keep the app open');
+      }
       const client = new HtzClient(creds.email.trim(), creds.password);
+      const session = newHanukkaSession();
       for (let i = 1; i <= total; i++) {
         if (cancelRef.current) {
           push('— cancelled —');
@@ -61,6 +72,8 @@ export default function HanukkaScreen() {
           phone: phoneCheck.value,
           collected: variant.trim() || undefined,
           dryRun,
+          session,
+          forceReload: reload && i > 1,
           shouldStop: () => cancelRef.current,
           log: push,
         });
@@ -75,6 +88,7 @@ export default function HanukkaScreen() {
     } catch (e: any) {
       push('✗ ' + (e?.message ?? String(e)));
     } finally {
+      if (keptAlive) await stopKeepAlive();
       setProgress('');
       setBusy(false);
     }
@@ -154,6 +168,33 @@ export default function HanukkaScreen() {
             thumbColor="#fff"
           />
         </View>
+
+        <View style={styles.switchRow}>
+          <Text style={[styles.label, { flex: 1 }]}>Reload the item page on every repeat</Text>
+          <Switch
+            value={reload}
+            onValueChange={setReload}
+            trackColor={{ true: theme.accent, false: theme.border }}
+            thumbColor="#fff"
+          />
+        </View>
+        <Text style={styles.hint}>
+          Off: one login and one item-page load for the whole batch — repeats go straight to cart + pay.
+        </Text>
+
+        <View style={styles.switchRow}>
+          <Text style={[styles.label, { flex: 1 }]}>Keep running in the background</Text>
+          <Switch
+            value={background}
+            onValueChange={setBackground}
+            trackColor={{ true: theme.accent, false: theme.border }}
+            thumbColor="#fff"
+          />
+        </View>
+        <Text style={styles.hint}>
+          iOS: holds a silent audio session so the loop keeps going when you switch apps or lock the screen.
+          Android: same trick — set the app to Unrestricted battery use for long batches.
+        </Text>
 
         <View style={styles.actionRow}>
           <Pressable

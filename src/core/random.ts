@@ -18,20 +18,25 @@ function viewOf(array: ArrayBufferView): Uint8Array {
 export function installRandomPolyfill(): void {
   const g: any = globalThis as any;
 
-  if (!g.crypto) g.crypto = {};
+  try {
+    if (!g.crypto) g.crypto = {};
 
-  if (typeof g.crypto.getRandomValues !== 'function') {
-    const impl: GetRandomValues = <T extends ArrayBufferView | null>(array: T): T => {
-      if (!array) throw new TypeError('getRandomValues: argument is null');
-      const bytes = Crypto.getRandomBytes(array.byteLength);
-      viewOf(array as ArrayBufferView).set(bytes);
-      return array;
-    };
-    g.crypto.getRandomValues = impl;
-  }
+    if (typeof g.crypto.getRandomValues !== 'function') {
+      const impl: GetRandomValues = <T extends ArrayBufferView | null>(array: T): T => {
+        if (!array) throw new TypeError('getRandomValues: argument is null');
+        const bytes = Crypto.getRandomBytes(array.byteLength);
+        viewOf(array as ArrayBufferView).set(bytes);
+        return array;
+      };
+      g.crypto.getRandomValues = impl;
+    }
 
-  if (typeof g.crypto.randomUUID !== 'function') {
-    g.crypto.randomUUID = () => Crypto.randomUUID();
+    if (typeof g.crypto.randomUUID !== 'function') {
+      g.crypto.randomUUID = () => Crypto.randomUUID();
+    }
+  } catch (e) {
+    // never let the polyfill take the app down; encryption surfaces a clear error
+    console.warn('crypto polyfill unavailable:', e);
   }
 }
 

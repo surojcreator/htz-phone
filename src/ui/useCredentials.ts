@@ -66,3 +66,5 @@ export function useCredentials() {
     rememberState,
   };
 }
+
+export type CredentialsApi = ReturnType<typeof useCredentials>;

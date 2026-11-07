@@ -13,21 +13,23 @@ import {
 } from 'react-native';
 
 import { HtzClient, STALE_CANDIDATES } from '../core/api';
+import { checkPhone } from '../core/format';
 import { STORAGE_LABEL } from '../core/storage';
+import { useCreds } from '../ui/credentials';
 import { theme } from '../ui/theme';
-import { useCredentials } from '../ui/useCredentials';
 
 type Row = { label: string; value: string; ok: boolean };
 
 export default function SetPhoneScreen() {
-  const creds = useCredentials();
+  const creds = useCreds();
   const [phone, setPhone] = useState('0555071161');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [done, setDone] = useState(false);
 
-  const canRun = !!creds.email && !!creds.password && !!phone && !busy;
+  const phoneCheck = checkPhone(phone);
+  const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && !busy;
 
   async function run() {
     setBusy(true);
@@ -40,7 +42,7 @@ export default function SetPhoneScreen() {
       const before = await client.appLogin();
       const beforePhone = String(before.phone ?? '');
 
-      await client.appSetPhone(phone.trim());
+      await client.appSetPhone(phoneCheck.value);
 
       const after = await client.appLogin();
       const afterPhone = String(after.phone ?? '');
@@ -48,12 +50,12 @@ export default function SetPhoneScreen() {
 
       const out: Row[] = [
         { label: 'phone before', value: beforePhone, ok: true },
-        { label: 'phone after', value: afterPhone, ok: norm(afterPhone) === norm(phone) },
+        { label: 'phone after', value: afterPhone, ok: norm(afterPhone) === norm(phoneCheck.value) },
       ];
 
       const changed = Object.keys({ ...before, ...after }).filter(
         (k) =>
-          !['phone', 'last_update', 'date_created', 'home_arr', 'params'].includes(k) &&
+          !['phone', 'last_update', 'date_created', 'home_arr', 'params', 'birthday', 'allow_app_rating'].includes(k) &&
           JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
       );
       out.push({
@@ -74,8 +76,6 @@ export default function SetPhoneScreen() {
       setRows(out);
       const allOk = out.every((r) => r.ok);
       setDone(allOk);
-
-      // only remember credentials that actually worked
       if (allOk) await creds.persist(creds.email, creds.password);
     } catch (e: any) {
       setError(e?.message ?? String(e));
@@ -96,15 +96,15 @@ export default function SetPhoneScreen() {
           update, so only the phone changes.
         </Text>
 
+        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />
+        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure />
         <Field
-          label="Email"
-          value={creds.email}
-          onChange={creds.setEmail}
-          keyboard="email-address"
-          autoCap="none"
+          label="New phone"
+          value={phone}
+          onChange={setPhone}
+          keyboard="phone-pad"
+          error={phone.length > 0 && !phoneCheck.ok ? phoneCheck.error : undefined}
         />
-        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure autoCap="none" />
-        <Field label="New phone" value={phone} onChange={setPhone} keyboard="phone-pad" />
 
         <RememberRow
           value={creds.remember}
@@ -189,22 +189,33 @@ export function Field(props: {
   secure?: boolean;
   keyboard?: 'default' | 'email-address' | 'phone-pad';
   autoCap?: 'none' | 'sentences';
+  error?: string;
 }) {
+  const [visible, setVisible] = useState(false);
+
   return (
     <View style={{ marginTop: 14 }}>
       <Text style={styles.label}>{props.label}</Text>
-      <TextInput
-        value={props.value}
-        onChangeText={props.onChange}
-        secureTextEntry={props.secure}
-        keyboardType={props.keyboard ?? 'default'}
-        autoCapitalize={props.autoCap ?? 'none'}
-        autoCorrect={false}
-        autoComplete="off"
-        textContentType="none"
-        placeholderTextColor={theme.dim}
-        style={styles.input}
-      />
+      <View style={[styles.inputWrap, props.error ? { borderColor: theme.bad } : null]}>
+        <TextInput
+          value={props.value}
+          onChangeText={props.onChange}
+          secureTextEntry={props.secure && !visible}
+          keyboardType={props.keyboard ?? 'default'}
+          autoCapitalize={props.autoCap ?? 'none'}
+          autoCorrect={false}
+          autoComplete="off"
+          textContentType="none"
+          placeholderTextColor={theme.dim}
+          style={styles.input}
+        />
+        {props.secure && (
+          <Pressable onPress={() => setVisible((v) => !v)} hitSlop={10} style={styles.eye}>
+            <Text style={styles.eyeText}>{visible ? 'hide' : 'show'}</Text>
+          </Pressable>
+        )}
+      </View>
+      {!!props.error && <Text style={styles.errorText}>{props.error}</Text>}
     </View>
   );
 }
@@ -217,16 +228,25 @@ const styles = StyleSheet.create({
   code: { color: theme.accent },
   label: { color: theme.dim, fontSize: 12, marginBottom: 6, letterSpacing: 0.3 },
   hint: { color: theme.dim, fontSize: 11, marginTop: 2 },
-  input: {
+  errorText: { color: theme.bad, fontSize: 11.5, marginTop: 5 },
+  inputWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: theme.card,
     borderColor: theme.border,
     borderWidth: 1,
     borderRadius: theme.radius,
+    paddingRight: 10,
+  },
+  input: {
+    flex: 1,
     paddingHorizontal: 14,
     paddingVertical: Platform.OS === 'ios' ? 14 : 10,
     color: theme.text,
     fontSize: 16,
   },
+  eye: { paddingHorizontal: 6, paddingVertical: 4 },
+  eyeText: { color: theme.accent, fontSize: 12, fontWeight: '700' },
   rememberRow: {
     flexDirection: 'row',
     alignItems: 'center',

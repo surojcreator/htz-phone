@@ -31,6 +31,7 @@ export type HanukkaOptions = {
   payment?: string;        // default '2' (two payments)
   payOption?: string;      // forced 'new_card'
   dryRun?: boolean;
+  shouldStop?: () => boolean;
   log?: (line: string) => void;
 };
 
@@ -130,10 +131,17 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
 
   let proj = opts.proj || HANUKKA_GROUP;
   const item = opts.itemId || HANUKKA_DEFAULT_ITEM;
+  let variants: Variant[] = [];
+  const stopped = () => (opts.shouldStop ? opts.shouldStop() : false);
+  const abort = (where: string): HanukkaResult => {
+    add('stopped', false, `cancelled before ${where}`);
+    return { ok: false, steps, variants, error: `stopped before ${where}` };
+  };
 
   try {
     await client.webLogin();
     add('web login', true, client.email);
+    if (stopped()) return abort('wallet sign-in');
 
     // ---- wallet sign-in for the item's project -------------------------
     const signIn = async (p: string): Promise<string | null> => {
@@ -180,7 +188,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     }
 
     const title = text((html.match(/class="item_title"[^>]*>([\s\S]{0,160}?)<\//) || [])[1] || '');
-    const variants = parseVariants(html);
+    variants = parseVariants(html);
     const allowance = Number((html.match(/data-max_no_points=['"](\d+)['"]/) || html.match(/data-max=['"](\d+)['"]/) || [])[1] || 0);
     add('item', true, `${title || item} · ${variants.length} variant(s)${allowance ? ` · allowance ${allowance}` : ''}`);
 
@@ -193,6 +201,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     const total = wanted.reduce((a, l) => a + l.qty, 0);
     if (allowance && total > allowance) log(`! ${total} units requested, allowance is ${allowance}`);
     add('cart selection', true, wanted.map((l) => `${l.id}×${l.qty}`).join(', '));
+    if (stopped()) return abort('cart add');
 
     // ---- seed the cart ------------------------------------------------
     await client.webAjax('cart_service', 'empty_cart', {}, '/cart', 'act');
@@ -216,8 +225,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     // ---- checkout page: supplier + payment options ---------------------
     const co = await client.webGet('/checkout2_wallet');
     const supplier = (co.match(/name="preferredPaymentsSelectBox\[(\d+)\]"/) || [])[1] || '2452';
-    const payment =
-      (co.match(/name="preferredPaymentsSelectBox\[\d+\]"[^>]*>[\s\S]{0,800}?<option[^>]*value="2"/) ? '2' : '2');
+    const payment = '2';   // two payments — the option the site checks by default
     add('checkout page', true, `supplier ${supplier} · payment ${payment}`);
 
     const payBody = buildPayBody({
@@ -233,6 +241,8 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       log('— dry run, payload not sent —');
       return { ok: true, steps, variants, payload: payBody };
     }
+
+    if (stopped()) return abort('payment');
 
     const pay = await client.webPostRaw(payBody, '/checkout2_wallet');
     const relocation = pay && pay.relocation;

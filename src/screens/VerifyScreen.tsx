@@ -11,26 +11,28 @@ import {
 } from 'react-native';
 
 import { Check, HtzClient } from '../core/api';
+import { checkPhone } from '../core/format';
 import { theme } from '../ui/theme';
-import { useCredentials } from '../ui/useCredentials';
+import { useCreds } from '../ui/credentials';
 import { Field } from './SetPhoneScreen';
 
 export default function VerifyScreen() {
-  const creds = useCredentials();
+  const creds = useCreds();
   const [expected, setExpected] = useState('0555071161');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checks, setChecks] = useState<Check[] | null>(null);
   const [ok, setOk] = useState(false);
 
-  const canRun = !!creds.email && !!creds.password && !!expected && !busy;
+  const phoneCheck = checkPhone(expected);
+  const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && !busy;
 
   async function run() {
     setBusy(true);
     setError(null);
     setChecks(null);
     try {
-      const report = await new HtzClient(creds.email.trim(), creds.password).verify(expected.trim());
+      const report = await new HtzClient(creds.email.trim(), creds.password).verify(phoneCheck.value);
       setChecks(report.checks);
       setOk(report.ok);
       if (report.ok) await creds.persist(creds.email, creds.password);
@@ -58,7 +60,8 @@ export default function VerifyScreen() {
 
         <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />
         <Field label="Password" value={creds.password} onChange={creds.setPassword} secure />
-        <Field label="Expected phone" value={expected} onChange={setExpected} keyboard="phone-pad" />
+        <Field label="Expected phone" value={expected} onChange={setExpected} keyboard="phone-pad"
+               error={expected.length > 0 && !phoneCheck.ok ? phoneCheck.error : undefined} />
 
         <Pressable
           onPress={run}

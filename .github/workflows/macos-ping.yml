@@ -1,0 +1,9 @@
+name: macos-ping
+on:
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: macos-14
+    steps:
+      - run: echo "macOS runner up: $(sw_vers -productVersion) $(uname -m)"
+      - run: xcodebuild -version

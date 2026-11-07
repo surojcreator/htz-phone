@@ -6,24 +6,28 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
 
 import { HtzClient, STALE_CANDIDATES } from '../core/api';
+import { STORAGE_LABEL } from '../core/storage';
 import { theme } from '../ui/theme';
+import { useCredentials } from '../ui/useCredentials';
 
 type Row = { label: string; value: string; ok: boolean };
 
 export default function SetPhoneScreen() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const creds = useCredentials();
   const [phone, setPhone] = useState('0555071161');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [done, setDone] = useState(false);
+
+  const canRun = !!creds.email && !!creds.password && !!phone && !busy;
 
   async function run() {
     setBusy(true);
@@ -31,7 +35,7 @@ export default function SetPhoneScreen() {
     setRows([]);
     setDone(false);
     try {
-      const client = new HtzClient(email.trim(), password);
+      const client = new HtzClient(creds.email.trim(), creds.password);
 
       const before = await client.appLogin();
       const beforePhone = String(before.phone ?? '');
@@ -47,7 +51,6 @@ export default function SetPhoneScreen() {
         { label: 'phone after', value: afterPhone, ok: norm(afterPhone) === norm(phone) },
       ];
 
-      // nothing else may move
       const changed = Object.keys({ ...before, ...after }).filter(
         (k) =>
           !['phone', 'last_update', 'date_created', 'home_arr', 'params'].includes(k) &&
@@ -69,7 +72,11 @@ export default function SetPhoneScreen() {
       }
 
       setRows(out);
-      setDone(out.every((r) => r.ok));
+      const allOk = out.every((r) => r.ok);
+      setDone(allOk);
+
+      // only remember credentials that actually worked
+      if (allOk) await creds.persist(creds.email, creds.password);
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -89,18 +96,27 @@ export default function SetPhoneScreen() {
           update, so only the phone changes.
         </Text>
 
-        <Field label="Email" value={email} onChange={setEmail} keyboard="email-address" autoCap="none" />
-        <Field label="Password" value={password} onChange={setPassword} secure autoCap="none" />
+        <Field
+          label="Email"
+          value={creds.email}
+          onChange={creds.setEmail}
+          keyboard="email-address"
+          autoCap="none"
+        />
+        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure autoCap="none" />
         <Field label="New phone" value={phone} onChange={setPhone} keyboard="phone-pad" />
+
+        <RememberRow
+          value={creds.remember}
+          onChange={creds.setRemember}
+          state={creds.rememberState}
+          onForget={creds.forget}
+        />
 
         <Pressable
           onPress={run}
-          disabled={busy || !email || !password || !phone}
-          style={({ pressed }) => [
-            styles.button,
-            (busy || !email || !password || !phone) && styles.buttonDisabled,
-            pressed && { opacity: 0.85 },
-          ]}
+          disabled={!canRun}
+          style={({ pressed }) => [styles.button, !canRun && styles.buttonDisabled, pressed && { opacity: 0.85 }]}
         >
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Set phone</Text>}
         </Pressable>
@@ -120,15 +136,49 @@ export default function SetPhoneScreen() {
             {rows.map((r) => (
               <View key={r.label} style={styles.row}>
                 <Text style={styles.rowLabel}>{r.label}</Text>
-                <Text style={[styles.rowValue, { color: r.ok ? theme.ok : theme.bad }]}>
-                  {r.value}
-                </Text>
+                <Text style={[styles.rowValue, { color: r.ok ? theme.ok : theme.bad }]}>{r.value}</Text>
               </View>
             ))}
           </View>
         )}
       </ScrollView>
     </KeyboardAvoidingView>
+  );
+}
+
+function RememberRow(props: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  state: 'idle' | 'saved' | 'cleared' | 'unavailable';
+  onForget: () => void;
+}) {
+  const hint =
+    props.state === 'saved'
+      ? `Saved in ${STORAGE_LABEL}`
+      : props.state === 'cleared'
+      ? 'Not saved'
+      : props.state === 'unavailable'
+      ? 'Secure storage unavailable on this build'
+      : `Stored in ${STORAGE_LABEL}`;
+
+  return (
+    <View style={styles.rememberRow}>
+      <View style={{ flex: 1 }}>
+        <Text style={styles.label}>Remember email &amp; password</Text>
+        <Text style={styles.hint}>{hint}</Text>
+      </View>
+      {props.state === 'saved' && (
+        <Pressable onPress={props.onForget} style={styles.forget}>
+          <Text style={styles.forgetText}>Forget</Text>
+        </Pressable>
+      )}
+      <Switch
+        value={props.value}
+        onValueChange={props.onChange}
+        trackColor={{ true: theme.accent, false: theme.border }}
+        thumbColor="#fff"
+      />
+    </View>
   );
 }
 
@@ -150,6 +200,8 @@ export function Field(props: {
         keyboardType={props.keyboard ?? 'default'}
         autoCapitalize={props.autoCap ?? 'none'}
         autoCorrect={false}
+        autoComplete="off"
+        textContentType="none"
         placeholderTextColor={theme.dim}
         style={styles.input}
       />
@@ -164,6 +216,7 @@ const styles = StyleSheet.create({
   sub: { color: theme.dim, fontSize: 13, marginTop: 6, lineHeight: 19 },
   code: { color: theme.accent },
   label: { color: theme.dim, fontSize: 12, marginBottom: 6, letterSpacing: 0.3 },
+  hint: { color: theme.dim, fontSize: 11, marginTop: 2 },
   input: {
     backgroundColor: theme.card,
     borderColor: theme.border,
@@ -174,6 +227,26 @@ const styles = StyleSheet.create({
     color: theme.text,
     fontSize: 16,
   },
+  rememberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 18,
+    backgroundColor: theme.cardAlt,
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  forget: {
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  forgetText: { color: theme.dim, fontSize: 11, fontWeight: '600' },
   button: {
     marginTop: 22,
     backgroundColor: theme.accent,

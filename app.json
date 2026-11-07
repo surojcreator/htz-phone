@@ -10,7 +10,9 @@
       "resizeMode": "contain",
       "backgroundColor": "#0b1220"
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.htzphone.app",
@@ -25,10 +27,15 @@
       "adaptiveIcon": {
         "backgroundColor": "#0b1220"
       },
-      "permissions": ["android.permission.INTERNET"]
+      "permissions": [
+        "android.permission.INTERNET"
+      ]
     },
     "web": {
       "bundler": "metro"
-    }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
   }
 }

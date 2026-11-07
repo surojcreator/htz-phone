@@ -12,25 +12,28 @@ import {
 
 import { Check, HtzClient } from '../core/api';
 import { theme } from '../ui/theme';
+import { useCredentials } from '../ui/useCredentials';
 import { Field } from './SetPhoneScreen';
 
 export default function VerifyScreen() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const creds = useCredentials();
   const [expected, setExpected] = useState('0555071161');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checks, setChecks] = useState<Check[] | null>(null);
   const [ok, setOk] = useState(false);
 
+  const canRun = !!creds.email && !!creds.password && !!expected && !busy;
+
   async function run() {
     setBusy(true);
     setError(null);
     setChecks(null);
     try {
-      const report = await new HtzClient(email.trim(), password).verify(expected.trim());
+      const report = await new HtzClient(creds.email.trim(), creds.password).verify(expected.trim());
       setChecks(report.checks);
       setOk(report.ok);
+      if (report.ok) await creds.persist(creds.email, creds.password);
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -53,18 +56,14 @@ export default function VerifyScreen() {
           stale number.
         </Text>
 
-        <Field label="Email" value={email} onChange={setEmail} keyboard="email-address" />
-        <Field label="Password" value={password} onChange={setPassword} secure />
+        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />
+        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure />
         <Field label="Expected phone" value={expected} onChange={setExpected} keyboard="phone-pad" />
 
         <Pressable
           onPress={run}
-          disabled={busy || !email || !password || !expected}
-          style={({ pressed }) => [
-            styles.button,
-            (busy || !email || !password || !expected) && styles.buttonDisabled,
-            pressed && { opacity: 0.85 },
-          ]}
+          disabled={!canRun}
+          style={({ pressed }) => [styles.button, !canRun && styles.buttonDisabled, pressed && { opacity: 0.85 }]}
         >
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Run sweep</Text>}
         </Pressable>
@@ -87,9 +86,7 @@ export default function VerifyScreen() {
                   <Text style={styles.rowLabel}>{c.name}</Text>
                   {!!c.note && <Text style={styles.note}>{c.note}</Text>}
                 </View>
-                <Text style={[styles.badge, { color: color(c), borderColor: color(c) }]}>
-                  {flag(c)}
-                </Text>
+                <Text style={[styles.badge, { color: color(c), borderColor: color(c) }]}>{flag(c)}</Text>
                 <Text style={[styles.rowValue, { color: color(c) }]} numberOfLines={1}>
                   {c.value}
                 </Text>

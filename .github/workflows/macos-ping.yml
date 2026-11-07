@@ -2,8 +2,12 @@ name: macos-ping
 on:
   workflow_dispatch:
 jobs:
-  ping:
-    runs-on: macos-14
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - run: echo "macOS runner up: $(sw_vers -productVersion) $(uname -m)"
-      - run: xcodebuild -version
+      - run: echo "runner=${{ matrix.os }} os=$(uname -s) arch=$(uname -m)"
+      - run: xcodebuild -version || true

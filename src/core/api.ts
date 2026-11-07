@@ -43,13 +43,22 @@ const canon = (s: unknown) => {
   return d.startsWith('972') ? `0${d.slice(3)}` : d;
 };
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+async function withTimeout<T>(
+  run: Promise<T> | ((signal?: AbortSignal) => Promise<T>),
+  ms: number,
+): Promise<T> {
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+    timer = setTimeout(() => {
+      try { ctrl?.abort(); } catch { /* ignore */ }
+      reject(new Error(`timeout after ${ms}ms`));
+    }, ms);
   });
   try {
-    return await Promise.race([p, timeout]);
+    // call sites may pass a promise (no abort) or a function that accepts the signal
+    const started = typeof run === 'function' ? (run as (s?: AbortSignal) => Promise<T>)(ctrl?.signal) : run;
+    return await Promise.race([started, timeout]);
   } finally {
     clearTimeout(timer!);
   }
@@ -81,7 +90,8 @@ export function parseFormFields(body: string): DetailsForm {
     const tag = m[0];
     const kind = m[1].toLowerCase();
     const attr = (name: string) => {
-      const a = tag.match(new RegExp(name + '\\s*=\\s*["\']([^"\']*)', 'i'));
+      // anchored so `data-value=` / `data-name=` can never be mistaken for the real thing
+      const a = tag.match(new RegExp('(?:^|\\s)' + name + '\\s*=\\s*["\']([^"\']*)', 'i'));
       return a ? a[1] : '';
     };
     const name = attr('name');
@@ -124,20 +134,39 @@ export class HtzClient {
    * no jar, so we mirror Set-Cookie ourselves and send it back explicitly —
    * harmless in RN, required for the headless harness.
    */
+  /**
+   * Cookies are keyed by host: `cms.htzone.co.il` and `www.htzone.co.il` issue
+   * separate PHPSESSIDs, and sending the API's session to the website (or the
+   * reverse) makes a valid login look like "מייל או סיסמא לא נכונים".
+   */
   private jar: Record<string, string> = {};
 
   constructor(public email: string, public password: string) {}
 
-  private cookieHeader(): string | undefined {
-    const parts = Object.entries(this.jar).map(([k, v]) => `${k}=${v}`);
+  private static hostOf(url: string): string {
+    try {
+      return new URL(url).host;
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private cookieHeaderFor(url: string): string | undefined {
+    const prefix = HtzClient.hostOf(url) + '|';
+    const parts = Object.entries(this.jar)
+      .filter(([k]) => k.startsWith(prefix))
+      .map(([k, v]) => `${k.slice(prefix.length)}=${v}`);
     return parts.length ? parts.join('; ') : undefined;
   }
 
-  private absorb(res: Response) {
+  private absorb(res: Response, url: string) {
     const h: any = res.headers;
     const raw: string[] =
       typeof h.getSetCookie === 'function' ? h.getSetCookie() : [h.get('set-cookie')].filter(Boolean);
-    for (const one of raw) Object.assign(this.jar, parseSetCookie(one));
+    const prefix = HtzClient.hostOf(url) + '|';
+    for (const one of raw) {
+      for (const [k, v] of Object.entries(parseSetCookie(one))) this.jar[prefix + k] = v;
+    }
   }
 
   private async postJson(url: string, body: unknown): Promise<any> {
@@ -145,7 +174,7 @@ export class HtzClient {
       Accept: 'application/json',
       'Content-Type': 'application/json',
     };
-    const cookie = this.cookieHeader();
+    const cookie = this.cookieHeaderFor(url);
     if (cookie) headers.Cookie = cookie;
 
     const res = await withTimeout(
@@ -160,7 +189,7 @@ export class HtzClient {
       }),
       25000,
     );
-    this.absorb(res);
+    this.absorb(res, url);
     const text = await res.text();
     try {
       return JSON.parse(text);
@@ -171,14 +200,16 @@ export class HtzClient {
 
   /** Web login: needs the inline secure_login token from /login. */
   async webLogin(): Promise<void> {
+    const loginUrl = `${WEB}/login`;
+    const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
     const pageRes = await withTimeout(
-      fetch(`${WEB}/login`, {
-        headers: this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {},
+      fetch(loginUrl, {
+        headers: this.cookieHeaderFor(loginUrl) ? { Cookie: this.cookieHeaderFor(loginUrl)! } : {},
         credentials: 'include',
       }),
       25000,
     );
-    this.absorb(pageRes);
+    this.absorb(pageRes, loginUrl);
     const page = await pageRes.text();
     const m = page.match(/var\s+secure_login\s*=\s*"([^"]+)"/);
     if (!m) throw new Error('secure_login token not found on /login');
@@ -193,41 +224,53 @@ export class HtzClient {
     });
 
     const res = await withTimeout(
-      fetch(`${WEB}/_ajax/ajax.index.php`, {
+      fetch(ajaxUrl, {
         method: 'POST',
         headers: {
           Accept: 'application/json, text/javascript, */*; q=0.01',
           'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
           'X-Requested-With': 'XMLHttpRequest',
-          Referer: `${WEB}/login`,
+          Referer: loginUrl,
           Origin: WEB,
-          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+          ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
         },
         body: form.toString(),
         credentials: 'include',
       }),
       25000,
     );
-    this.absorb(res);
+    this.absorb(res, ajaxUrl);
     const json = await res.json();
-    if ((json?.err ?? '').toString().trim()) throw new Error(`web login failed: ${json.err}`);
+    const webErr = (json?.err ?? '').toString().trim();
+    if (webErr) {
+      // the site uses one generic message for several causes
+      const hint = /לא נכונים/.test(webErr)
+        ? ' — the site rejected the credentials: check the password (press Forget and retype it), and note that repeated attempts can be rate-limited'
+        : '';
+      throw new Error(`web login failed: ${webErr}${hint}`);
+    }
   }
 
   /** Web read: both phone-ish inputs in the details form. */
   async webReadPhones(): Promise<{ telephone: string; phone: string; html: string }> {
+    const pageUrl = `${WEB}/support_page`;
     const res = await withTimeout(
-      fetch(`${WEB}/support_page`, {
-        headers: this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {},
+      fetch(pageUrl, {
+        headers: this.cookieHeaderFor(pageUrl) ? { Cookie: this.cookieHeaderFor(pageUrl)! } : {},
         credentials: 'include',
       }),
       25000,
     );
-    this.absorb(res);
+    this.absorb(res, pageUrl);
     const html = await res.text();
+    // The details form lives inside a JSON-escaped HTML string. Unescape the
+    // quotes once, then match conventionally — and anchor `value=` so
+    // `data-value=` can never win the match.
+    const flat = html.replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
     const read = (field: string) => {
-      const tag = html.match(new RegExp(`<input[^>]*name=['"]${field}['"][^>]*>`));
+      const tag = flat.match(new RegExp(`<input[^>]*\\bname=['"]${field}['"][^>]*>`));
       if (!tag) return '';
-      const v = tag[0].match(/value=['"]([^'"]*)['"]/);
+      const v = tag[0].match(/(?:^|\s)value\s*=\s*['"]([^'"]*)/);
       return v ? v[1] : '';
     };
     return { telephone: read('telephone'), phone: read('phone'), html };
@@ -250,7 +293,10 @@ export class HtzClient {
         value: String(u.phone ?? ''),
         ok: canon(u.phone) === expect,
       });
-      const blob = JSON.stringify(u);
+      // `home_arr` is the marketing banner feed — it can echo arbitrary phone
+      // numbers from other users' campaigns, so it must never be scanned.
+      const { home_arr: _feed, params: _params, ...identity } = u as Record<string, any>;
+      const blob = JSON.stringify(identity);
       for (const stale of STALE_CANDIDATES) {
         if (stale === expect) continue;
         checks.push({
@@ -403,7 +449,9 @@ export class HtzClient {
     if (!webAlready) await this.webApplyPhone(phone, before);
 
     // 2. app write, repairing anything the web step disturbed
-    const mid = await this.appLogin();
+    // (when the web write was skipped the record is unchanged — reuse it and
+    //  save a login, because repeated logins are what triggers rate limiting)
+    const mid = webAlready ? before : await this.appLogin();
     const repairs: Record<string, string> = {};
     for (const key of REPAIRABLE) {
       const was = (before as any)[key];
@@ -444,7 +492,10 @@ export class HtzClient {
     });
     if (res?.status !== 1) {
       const msg = res?.err?.content || JSON.stringify(res).slice(0, 160);
-      throw new Error(`app login failed: ${msg}`);
+      const hint = /סיסמא|סיסמה|נכונים/.test(String(msg))
+        ? ' — the app API rejected the credentials: check the password (press Forget and retype it)'
+        : '';
+      throw new Error(`app login failed: ${msg}${hint}`);
     }
     return res.data as User;
   }
@@ -455,7 +506,7 @@ export class HtzClient {
     const res = await withTimeout(
       fetch(url, {
         headers: {
-          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+          ...(this.cookieHeaderFor(url) ? { Cookie: this.cookieHeaderFor(url)! } : {}),
           Accept: 'text/html,application/xhtml+xml',
           Referer: `${WEB}/`,
         },
@@ -463,7 +514,7 @@ export class HtzClient {
       }),
       30000,
     );
-    this.absorb(res);
+    this.absorb(res, url);
     return res.text();
   }
 
@@ -485,8 +536,9 @@ export class HtzClient {
     const encoded = Object.entries(body)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join('&');
+    const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
     const res = await withTimeout(
-      fetch(`${WEB}/_ajax/ajax.index.php`, {
+      fetch(ajaxUrl, {
         method: 'POST',
         headers: {
           Accept: 'application/json, text/javascript, */*; q=0.01',
@@ -494,14 +546,14 @@ export class HtzClient {
           'X-Requested-With': 'XMLHttpRequest',
           Referer: WEB + referer,
           Origin: WEB,
-          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+          ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
         },
         body: encoded,
         credentials: 'include',
       }),
       30000,
     );
-    this.absorb(res);
+    this.absorb(res, ajaxUrl);
     const text = await res.text();
     try {
       return JSON.parse(text);
@@ -512,8 +564,9 @@ export class HtzClient {
 
   /** POST an already-encoded body (needed for repeated keys like collected_itemsArr[]). */
   async webPostRaw(body: string, referer = '/'): Promise<any> {
+    const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
     const res = await withTimeout(
-      fetch(`${WEB}/_ajax/ajax.index.php`, {
+      fetch(ajaxUrl, {
         method: 'POST',
         headers: {
           Accept: 'application/json, text/javascript, */*; q=0.01',
@@ -521,14 +574,14 @@ export class HtzClient {
           'X-Requested-With': 'XMLHttpRequest',
           Referer: WEB + referer,
           Origin: WEB,
-          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+          ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
         },
         body,
         credentials: 'include',
       }),
       30000,
     );
-    this.absorb(res);
+    this.absorb(res, ajaxUrl);
     const text = await res.text();
     try {
       return JSON.parse(text);

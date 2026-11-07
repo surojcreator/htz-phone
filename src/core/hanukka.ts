@@ -69,6 +69,16 @@ export function interpretPayResponse(pay: any): { ok: boolean; relocation?: stri
 
 const enc = (s: string) => encodeURIComponent(s);
 
+/** The site returns err as a string or as { content } — normalise both. */
+function errText(j: any): string {
+  const e = j && j.err;
+  if (!e) return '';
+  if (typeof e === 'string') return e.trim();
+  const s = e.content || e.msg || '';
+  if (s) return String(s).trim();
+  return JSON.stringify(e).slice(0, 160);
+}
+
 function text(s: string): string {
   return s.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -209,6 +219,10 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       add('item page', false, `did not render (${html.length} B)`);
       return { ok: false, steps, variants: [], error: 'item page did not render' };
     }
+    if (/אין לך זכאות/.test(html)) {
+      add('eligibility', false, 'PRO² gate closed — this account has no shop eligibility');
+      return { ok: false, steps, variants: [], error: 'no PRO² eligibility on this account' };
+    }
 
     const title = text((html.match(/class="item_title"[^>]*>([\s\S]{0,160}?)<\//) || [])[1] || '');
     variants = parseVariants(html);
@@ -236,8 +250,9 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     }, `/wallet_attraction_item/${item}`, 'act');
     const amount = addRes && addRes.data && Number(addRes.data.amount || 0);
     if (!addRes || addRes.status !== 1) {
-      add('cart add', false, (addRes && addRes.err && addRes.err.content) || 'rejected');
-      return { ok: false, steps, variants, error: 'cart add rejected' };
+      const detail = errText(addRes) || `status ${addRes?.status ?? '?'}: ${JSON.stringify(addRes).slice(0, 120)}`;
+      add('cart add', false, detail);
+      return { ok: false, steps, variants, error: detail };
     }
     if (amount === 0) {
       add('cart add', false, 'accepted but added 0 units (stock / per-member limit)');
@@ -270,8 +285,9 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     const pay = await client.webPostRaw(payBody, '/checkout2_wallet');
     const verdict = interpretPayResponse(pay);
     if (!verdict.ok) {
-      add('pay', false, String(verdict.error).slice(0, 160));
-      return { ok: false, steps, variants, payload: payBody, error: verdict.error, raw: pay };
+      const detail = verdict.error || errText(pay) || 'unrecognised response';
+      add('pay', false, detail.slice(0, 160));
+      return { ok: false, steps, variants, payload: payBody, error: detail, raw: pay };
     }
     if (verdict.relocation) {
       add('pay', true, `next → ${verdict.relocation}`);

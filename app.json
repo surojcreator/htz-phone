@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "Htz Phone",
+    "slug": "htz-phone",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "htzphone",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0b1220"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.htzphone.app",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false
+        }
+      }
+    },
+    "android": {
+      "package": "com.htzphone.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0b1220"
+      },
+      "permissions": ["android.permission.INTERNET"]
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

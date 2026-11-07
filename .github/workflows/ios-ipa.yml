@@ -1,0 +1,75 @@
+name: iOS IPA (unsigned)
+
+# Produces a real .ipa without a Mac and without an Apple developer account.
+#
+#   Actions → iOS IPA (unsigned) → Run workflow
+#   → download artifact "htz-phone-unsigned-ipa"
+#
+# The .ipa is unsigned: install it on a jailbroken/registered device, or feed it
+# to a signing service (Sideloadly, AltStore, Signulous, your own cert).
+# For a normally signed .ipa use EAS (see README) or Xcode on a Mac.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Generate the iOS project
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: CocoaPods
+        working-directory: ios
+        run: pod install --repo-update
+
+      - name: Archive (code signing disabled)
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          PROJECT=$(ls -d *.xcodeproj | head -1)
+          SCHEME=${PROJECT%.xcodeproj}
+          echo "scheme=$SCHEME"
+          xcodebuild \
+            -workspace *.xcworkspace \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      - name: Package Payload into an .ipa
+        run: |
+          set -euo pipefail
+          APP=$(find "$RUNNER_TEMP/app.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -1)
+          echo "app=$APP"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qry htz-phone-unsigned.ipa Payload
+          ls -lh htz-phone-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: htz-phone-unsigned-ipa
+          path: ${{ runner.temp }}/htz-phone-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

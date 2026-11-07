@@ -1,0 +1,11 @@
+node_modules/
+android/
+ios/
+dist/
+dist-ios/
+_expo/
+.expo/
+*.log
+*.err.log
+*.keystore
+.parsecheck/

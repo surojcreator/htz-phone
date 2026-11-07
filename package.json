@@ -1,0 +1,27 @@
+{
+  "name": "htz-phone",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "check": "tsx scripts/check.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "1.2.1",
+    "@noble/hashes": "1.7.1",
+    "expo": "~51.0.28",
+    "expo-status-bar": "~1.12.1",
+    "react": "18.2.0",
+    "react-native": "0.74.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "~18.2.79",
+    "tsx": "^4.23.15",
+    "typescript": "~5.3.3"
+  }
+}

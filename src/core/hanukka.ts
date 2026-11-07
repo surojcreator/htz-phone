@@ -41,8 +41,31 @@ export type HanukkaResult = {
   variants: Variant[];
   payload?: string;
   relocation?: string;
+  cardUrl?: string;
   error?: string;
+  raw?: unknown;
 };
+
+/**
+ * Classify the pay_order_wallet response.
+ *
+ * The site answers one of:
+ *   { relocation: "…" }                       order finished, follow the redirect
+ *   { html: "<iframe src=CreditGuard…>" }      order staged — card entry required
+ *   { err: {...} }                             refused
+ * The CreditGuard iframe is a SUCCESS for us: the order exists and waits for a card.
+ */
+export function interpretPayResponse(pay: any): { ok: boolean; relocation?: string; cardUrl?: string; error?: string } {
+  if (!pay || typeof pay !== 'object') return { ok: false, error: 'empty response' };
+  const err = pay.err && (pay.err.content || pay.err);
+  if (err) return { ok: false, error: String(err) };
+  if (pay.relocation) return { ok: true, relocation: String(pay.relocation) };
+  const html = typeof pay.html === 'string' ? pay.html : '';
+  const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+  if (iframe) return { ok: true, cardUrl: iframe[1] };
+  if (typeof pay.url === 'string' && pay.url) return { ok: true, cardUrl: pay.url };
+  return { ok: false, error: 'unrecognised response' };
+}
 
 const enc = (s: string) => encodeURIComponent(s);
 
@@ -245,18 +268,18 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     if (stopped()) return abort('payment');
 
     const pay = await client.webPostRaw(payBody, '/checkout2_wallet');
-    const relocation = pay && pay.relocation;
-    const err = pay && pay.err && (pay.err.content || pay.err);
-    if (err) {
-      add('pay', false, String(err).slice(0, 160));
-      return { ok: false, steps, variants, payload: payBody, error: String(err) };
+    const verdict = interpretPayResponse(pay);
+    if (!verdict.ok) {
+      add('pay', false, String(verdict.error).slice(0, 160));
+      return { ok: false, steps, variants, payload: payBody, error: verdict.error, raw: pay };
     }
-    if (relocation) {
-      add('pay', true, `next → ${relocation}`);
-      return { ok: true, steps, variants, payload: payBody, relocation };
+    if (verdict.relocation) {
+      add('pay', true, `next → ${verdict.relocation}`);
+      return { ok: true, steps, variants, payload: payBody, relocation: verdict.relocation, raw: pay };
     }
-    add('pay', false, 'no relocation returned — check the card step');
-    return { ok: false, steps, variants, payload: payBody, error: 'no relocation', relocation: undefined };
+    add('pay', true, 'order staged — card entry required');
+    log(`CARD PAYMENT REQUIRED -> ${verdict.cardUrl}`);
+    return { ok: true, steps, variants, payload: payBody, cardUrl: verdict.cardUrl, raw: pay };
   } catch (e: any) {
     add('error', false, e?.message ?? String(e));
     return { ok: false, steps, variants: [], error: e?.message ?? String(e) };

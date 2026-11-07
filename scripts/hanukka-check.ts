@@ -40,6 +40,10 @@ function arg(name: string, fallback = ''): string {
     console.log('\n  pay_order_wallet body:');
     console.log(res.payload.split('&').map((p) => '    ' + p).join('\n'));
   }
-  console.log('\n  RESULT:', res.ok ? (res.relocation ? 'NEXT ' + res.relocation : 'dry-run ok') : 'FAILED ' + (res.error || ''));
+  if (res.raw) {
+    console.log('\n  raw response:');
+    console.log('   ' + JSON.stringify(res.raw).slice(0, 1200));
+  }
+  console.log('\n  RESULT:', res.ok ? (res.relocation ? 'NEXT ' + res.relocation : res.cardUrl ? 'CARD REQUIRED -> ' + res.cardUrl : 'dry-run ok') : 'FAILED ' + (res.error || ''));
   process.exit(res.ok ? 0 : 1);
 })();

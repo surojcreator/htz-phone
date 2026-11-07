@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -172,10 +173,29 @@ export default function HanukkaScreen() {
         {result && (
           <View style={[styles.card, { borderColor: result.ok ? theme.ok : theme.bad }]}>
             <Text style={[styles.cardTitle, { color: result.ok ? theme.ok : theme.bad }]}>
-              {result.ok ? (result.relocation ? 'order submitted' : 'dry run ok') : 'failed'}
+              {result.ok
+                ? result.cardUrl
+                  ? 'order staged — card entry required'
+                  : result.relocation
+                  ? 'order submitted'
+                  : 'dry run ok'
+                : 'failed'}
             </Text>
             {result.relocation && <Text style={styles.mono}>next → {result.relocation}</Text>}
             {result.error && <Text style={[styles.mono, { color: theme.bad }]}>{result.error}</Text>}
+            {result.cardUrl && (
+              <>
+                <Text style={styles.mono} numberOfLines={2}>
+                  {result.cardUrl}
+                </Text>
+                <Pressable
+                  onPress={() => Linking.openURL(result.cardUrl!).catch(() => {})}
+                  style={({ pressed }) => [styles.cardButton, pressed && { opacity: 0.85 }]}
+                >
+                  <Text style={styles.cardButtonText}>Open card page</Text>
+                </Pressable>
+              </>
+            )}
           </View>
         )}
 
@@ -252,5 +272,13 @@ const styles = StyleSheet.create({
     padding: theme.pad,
   },
   cardTitle: { fontSize: 15, fontWeight: '700', marginBottom: 8 },
+  cardButton: {
+    marginTop: 12,
+    backgroundColor: theme.accent,
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  cardButtonText: { color: '#fff', fontSize: 14, fontWeight: '700' },
   mono: { color: theme.dim, fontSize: 11.5, lineHeight: 17 },
 });

@@ -4,9 +4,10 @@ import { Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react
 
 import SetPhoneScreen from './src/screens/SetPhoneScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
+import HanukkaScreen from './src/screens/HanukkaScreen';
 import { theme } from './src/ui/theme';
 
-type Tab = 'set' | 'verify';
+type Tab = 'set' | 'verify' | 'hanukka';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('set');
@@ -22,21 +23,21 @@ export default function App() {
       </View>
 
       <View style={styles.tabs}>
-        {(['set', 'verify'] as Tab[]).map((t) => (
+        {(['set', 'verify', 'hanukka'] as Tab[]).map((t) => (
           <Pressable
             key={t}
             onPress={() => setTab(t)}
             style={[styles.tab, tab === t && styles.tabActive]}
           >
             <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>
-              {t === 'set' ? 'Set phone' : 'Verify'}
+              {t === 'set' ? 'Set phone' : t === 'verify' ? 'Verify' : 'חנוכה'}
             </Text>
           </Pressable>
         ))}
       </View>
 
       <View style={styles.body}>
-        {tab === 'set' ? <SetPhoneScreen /> : <VerifyScreen />}
+        {tab === 'set' ? <SetPhoneScreen /> : tab === 'verify' ? <VerifyScreen /> : <HanukkaScreen />}
       </View>
     </SafeAreaView>
   );

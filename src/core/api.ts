@@ -256,6 +256,94 @@ export class HtzClient {
     return res.data as User;
   }
 
+  /** Raw web GET through the same session (cookies included). */
+  async webGet(path: string): Promise<string> {
+    const url = path.startsWith('http') ? path : WEB + path;
+    const res = await withTimeout(
+      fetch(url, {
+        headers: {
+          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+          Accept: 'text/html,application/xhtml+xml',
+          Referer: `${WEB}/`,
+        },
+        credentials: 'include',
+      }),
+      30000,
+    );
+    this.absorb(res);
+    return res.text();
+  }
+
+  /**
+   * POST to the site's AJAX layer as one of its pages would.
+   *
+   * The dispatcher uses `act=` for special_service / cart_service and
+   * `action=` for user_service / checkout2_service — sending the wrong one is
+   * silently accepted with an empty body, which is how this was found.
+   */
+  async webAjax(
+    file: string,
+    action: string,
+    form: Record<string, string>,
+    referer = '/',
+    verb: 'action' | 'act' = 'action',
+  ): Promise<any> {
+    const body: Record<string, string> = { ...form, file, [verb]: action };
+    const encoded = Object.entries(body)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    const res = await withTimeout(
+      fetch(`${WEB}/_ajax/ajax.index.php`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json, text/javascript, */*; q=0.01',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: WEB + referer,
+          Origin: WEB,
+          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+        },
+        body: encoded,
+        credentials: 'include',
+      }),
+      30000,
+    );
+    this.absorb(res);
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { raw: text.slice(0, 300) };
+    }
+  }
+
+  /** POST an already-encoded body (needed for repeated keys like collected_itemsArr[]). */
+  async webPostRaw(body: string, referer = '/'): Promise<any> {
+    const res = await withTimeout(
+      fetch(`${WEB}/_ajax/ajax.index.php`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json, text/javascript, */*; q=0.01',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          Referer: WEB + referer,
+          Origin: WEB,
+          ...(this.cookieHeader() ? { Cookie: this.cookieHeader()! } : {}),
+        },
+        body,
+        credentials: 'include',
+      }),
+      30000,
+    );
+    this.absorb(res);
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { raw: text.slice(0, 300) };
+    }
+  }
+
   /** App API partial update — only `phone` is sent, so nothing else is touched. */
   async appSetPhone(phone: string): Promise<void> {
     const write = async () => {

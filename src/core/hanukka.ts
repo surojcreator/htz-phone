@@ -227,7 +227,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     if (stopped()) return abort('cart add');
 
     // ---- seed the cart ------------------------------------------------
-    await client.webAjax('cart_service', 'empty_cart', {}, '/cart', 'act');
+    await client.webAjax("cart_service", "empty_cart", {}, `/wallet_attraction_item/${item}`, "act");
     const addRes = await client.webAjax('cart_service', 'add_wallet_attraction', {
       is_quick: '1',
       is_collected: variants.length ? '1' : '0',

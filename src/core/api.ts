@@ -66,6 +66,58 @@ function parseSetCookie(header: string | null): Record<string, string> {
   return jar;
 }
 
+export type DetailsForm = Record<string, string>;
+
+/** fields worth restoring if the web write disturbs them */
+const REPAIRABLE = ['birth_day', 'birth_month', 'city', 'ct_name', 'tz_number', 'first_name', 'last_name'];
+const IGNORE_IN_DIFF = new Set(['last_update', 'date_created', 'home_arr', 'params', 'birthday', 'allow_app_rating']);
+
+/** Parse the inputs/selects of an HTML form into the values jQuery would serialize. */
+export function parseFormFields(body: string): DetailsForm {
+  const out: DetailsForm = {};
+  const tagRe = /<(input|select)\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(body))) {
+    const tag = m[0];
+    const kind = m[1].toLowerCase();
+    const attr = (name: string) => {
+      const a = tag.match(new RegExp(name + '\\s*=\\s*["\']([^"\']*)', 'i'));
+      return a ? a[1] : '';
+    };
+    const name = attr('name');
+    if (!name) continue;
+    const type = (attr('type') || kind).toLowerCase();
+
+    if (kind === 'select') {
+      const rest = body.slice(m.index);
+      const end = rest.toLowerCase().indexOf('</select>');
+      const block = end >= 0 ? rest.slice(0, end) : rest;
+      const sel =
+        block.match(/<option[^>]*\bselected\b[^>]*>/i) || block.match(/<option[^>]*>/i);
+      let val = '';
+      if (sel) {
+        const v = sel[0].match(/value\s*=\s*["\']([^"\']*)/i);
+        if (v) val = v[1];
+        else {
+          const close = block.indexOf('</option>', sel.index ?? 0);
+          val = block
+            .slice((sel.index ?? 0) + sel[0].length, close >= 0 ? close : block.length)
+            .replace(/<[^>]+>/g, '')
+            .trim();
+        }
+      }
+      out[name] = val;
+    } else if (type === 'radio' || type === 'checkbox') {
+      if (/\bchecked\b/i.test(tag)) out[name] = attr('value') || 'on';
+    } else if (['submit', 'button', 'reset', 'file', 'image'].includes(type)) {
+      continue;
+    } else {
+      out[name] = attr('value');
+    }
+  }
+  return out;
+}
+
 export class HtzClient {
   /**
    * Cookies are handled natively by RN (OkHttp / NSURLSession). Node's fetch has
@@ -222,6 +274,18 @@ export class HtzClient {
         value: phone,
         ok: canon(phone) === expect,
       });
+      // "מייל נוסף" must stay empty on this side too
+      try {
+        const form = await this.webForm();
+        const more = String(form.email_more ?? '');
+        checks.push({
+          name: 'web · /support_page מייל נוסף empty',
+          value: more ? more.slice(0, 24) : 'empty',
+          ok: !more.trim(),
+        });
+      } catch {
+        checks.push({ name: 'web · details form', value: 'unreadable', ok: true, info: true });
+      }
       for (const stale of STALE_CANDIDATES) {
         if (stale === expect) continue;
         checks.push({
@@ -241,6 +305,135 @@ export class HtzClient {
     }
 
     return { ok: checks.filter((c) => !c.info).every((c) => c.ok), checks, user };
+  }
+
+  /** Every serializable field of the /support_page "my details" form. */
+  async webForm(): Promise<DetailsForm> {
+    const html = await this.webGet('/support_page');
+    const anchor = html.indexOf('"next_step":"details_form"');
+    if (anchor < 0) throw new Error('details form marker not found on /support_page');
+
+    // the section is a JSON-escaped HTML string; unescape it exactly
+    const tail = html.slice(anchor);
+    const marker = '"section_html":"';
+    const i = tail.indexOf(marker);
+    if (i < 0) throw new Error('section_html not found for the details form');
+    const buf: string[] = [];
+    let j = i + marker.length;
+    while (j < tail.length) {
+      const ch = tail[j];
+      if (ch === '\\' && j + 1 < tail.length) {
+        buf.push(tail[j], tail[j + 1]);
+        j += 2;
+        continue;
+      }
+      if (ch === '"') break;
+      buf.push(ch);
+      j += 1;
+    }
+    let section = '';
+    try {
+      section = JSON.parse('"' + buf.join('') + '"');
+    } catch {
+      throw new Error('could not decode the details section');
+    }
+    if (!section.includes('telephone')) throw new Error('details section has no telephone field');
+
+    const form = section.match(/<form[^>]*class=['"]update['"][^>]*>([\s\S]*?)<\/form>/i);
+    return parseFormFields(form ? form[1] : section);
+  }
+
+  /**
+   * Set `telephone` on the website. The endpoint REPLACES the record, so empty
+   * form fields are filled from the app record first and anything that would be
+   * blanked is refused.
+   */
+  async webApplyPhone(phone: string, appRecord?: User): Promise<{ filled: string[]; before: DetailsForm; after: DetailsForm }> {
+    const before = await this.webForm();
+    if (!('telephone' in before)) throw new Error('no telephone field in the details form');
+
+    const payload: DetailsForm = { ...before, telephone: phone };
+    const filled: string[] = [];
+    if (appRecord) {
+      for (const key of Object.keys(payload)) {
+        if (String(payload[key] ?? '').trim()) continue;
+        const appVal = (appRecord as any)[key];
+        if ((typeof appVal === 'string' || typeof appVal === 'number') && String(appVal).trim() && String(appVal) !== '0') {
+          payload[key] = String(appVal);
+          filled.push(key);
+        }
+      }
+    }
+
+    const risky = Object.keys(before).filter((k) => String(before[k] ?? '').trim() && !String(payload[k] ?? '').trim());
+    if (risky.length) throw new Error('refusing to blank fields: ' + risky.join(', '));
+
+    const res = await this.webAjax('user_service', 'register_form_update', payload, '/support_page', 'action');
+    const err = (res?.err ?? '').toString().trim();
+    if (err) throw new Error('web update: ' + err);
+
+    const after = await this.webForm();
+    return { filled, before, after };
+  }
+
+  /**
+   * Set the phone on BOTH surfaces and prove it.
+   *
+   * The app API and the website keep the number in different fields (`phone`
+   * vs `telephone`). Writing only one of them is what made the app disagree
+   * with the site, so this runs the same guarded sequence the desktop tool does.
+   */
+  async applyPhone(phone: string): Promise<{
+    appPhone: string;
+    appOk: boolean;
+    appEmail2: string;
+    email2Ok: boolean;
+    webTelephone: string;
+    webOk: boolean;
+    webWritten: boolean;
+    repairs: string[];
+    changed: string[];
+  }> {
+    const before = await this.appLogin();
+
+    // 1. website first (it replaces the record)
+    await this.webLogin();
+    const webBefore = await this.webForm();
+    const webAlready = canon(webBefore.telephone) === canon(phone);
+    if (!webAlready) await this.webApplyPhone(phone, before);
+
+    // 2. app write, repairing anything the web step disturbed
+    const mid = await this.appLogin();
+    const repairs: Record<string, string> = {};
+    for (const key of REPAIRABLE) {
+      const was = (before as any)[key];
+      const now = (mid as any)[key];
+      if (typeof was === 'string' && was.trim() && was.trim() !== '0') {
+        if (typeof now !== 'string' || !now.trim() || now.trim() === '0') repairs[key] = was;
+      }
+    }
+    await this.appSetPhone(phone, repairs);
+
+    // 3. read both back
+    const after = await this.appLogin();
+    const webAfter = await this.webForm();
+
+    const changed = Object.keys({ ...before, ...after }).filter(
+      (k) => !IGNORE_IN_DIFF.has(k) && k !== 'phone' && k !== 'email_2' &&
+        JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
+    );
+
+    return {
+      appPhone: String(after.phone ?? ''),
+      appOk: canon(after.phone) === canon(phone),
+      appEmail2: String(after.email_2 ?? ''),
+      email2Ok: !String(after.email_2 ?? '').trim(),
+      webTelephone: String(webAfter.telephone ?? ''),
+      webOk: canon(webAfter.telephone) === canon(phone),
+      webWritten: !webAlready,
+      repairs: Object.keys(repairs),
+      changed,
+    };
   }
 
   /** App API login. Credentials are encrypted exactly like the native app does. */
@@ -344,10 +537,14 @@ export class HtzClient {
     }
   }
 
-  /** App API partial update — only `phone` is sent, so nothing else is touched. */
-  async appSetPhone(phone: string): Promise<void> {
+  /** App API partial update — only the fields passed are sent. */
+  async appSetPhone(phone: string, extra?: Record<string, string>): Promise<void> {
     const write = async () => {
-      const res = await this.postJson(`${APP_API}editUserInformation/`, { phone });
+      const res = await this.postJson(`${APP_API}editUserInformation/`, {
+        phone,
+        email_2: '',
+        ...(extra ?? {}),
+      });
       if (res?.status !== 1) {
         const err = res?.err ?? {};
         const message = err?.content || JSON.stringify(res).slice(0, 160);

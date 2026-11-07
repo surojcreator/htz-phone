@@ -12,7 +12,7 @@ import {
   View,
 } from 'react-native';
 
-import { HtzClient, STALE_CANDIDATES } from '../core/api';
+import { HtzClient } from '../core/api';
 import { checkPhone } from '../core/format';
 import { STORAGE_LABEL } from '../core/storage';
 import { useCreds } from '../ui/credentials';
@@ -38,40 +38,22 @@ export default function SetPhoneScreen() {
     setDone(false);
     try {
       const client = new HtzClient(creds.email.trim(), creds.password);
-
-      const before = await client.appLogin();
-      const beforePhone = String(before.phone ?? '');
-
-      await client.appSetPhone(phoneCheck.value);
-
-      const after = await client.appLogin();
-      const afterPhone = String(after.phone ?? '');
-      const norm = (s: string) => s.replace(/\D/g, '');
+      const rep = await client.applyPhone(phoneCheck.value);
 
       const out: Row[] = [
-        { label: 'phone before', value: beforePhone, ok: true },
-        { label: 'phone after', value: afterPhone, ok: norm(afterPhone) === norm(phoneCheck.value) },
+        { label: 'app phone', value: rep.appPhone || '(none)', ok: rep.appOk },
+        { label: 'web telephone', value: rep.webTelephone || '(none)', ok: rep.webOk },
+        { label: 'מייל נוסף (app)', value: rep.appEmail2 || 'empty', ok: rep.email2Ok },
+        { label: 'web write', value: rep.webWritten ? 'applied' : 'already set', ok: true },
       ];
-
-      const changed = Object.keys({ ...before, ...after }).filter(
-        (k) =>
-          !['phone', 'last_update', 'date_created', 'home_arr', 'params', 'birthday', 'allow_app_rating'].includes(k) &&
-          JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
-      );
+      if (rep.repairs.length) {
+        out.push({ label: 'repaired', value: rep.repairs.join(', '), ok: true });
+      }
       out.push({
         label: 'other fields',
-        value: changed.length ? changed.join(', ') : 'unchanged',
-        ok: changed.length === 0,
+        value: rep.changed.length ? rep.changed.join(', ') : 'unchanged',
+        ok: rep.changed.length === 0,
       });
-
-      for (const stale of STALE_CANDIDATES) {
-        const blob = JSON.stringify(after);
-        out.push({
-          label: `stale ${stale}`,
-          value: blob.includes(stale) ? 'present' : 'absent',
-          ok: !blob.includes(stale),
-        });
-      }
 
       setRows(out);
       const allOk = out.every((r) => r.ok);

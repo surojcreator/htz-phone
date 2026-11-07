@@ -12,13 +12,13 @@ import {
   View,
 } from 'react-native';
 
-import { HtzClient } from '../core/api';
+import { Check, HtzClient } from '../core/api';
 import { checkPhone } from '../core/format';
 import { STORAGE_LABEL } from '../core/storage';
 import { useCreds } from '../ui/credentials';
 import { theme } from '../ui/theme';
 
-type Row = { label: string; value: string; ok: boolean };
+type Row = { label: string; value: string; ok: boolean; info?: boolean };
 
 export default function SetPhoneScreen() {
   const creds = useCreds();
@@ -26,6 +26,7 @@ export default function SetPhoneScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
+  const [checks, setChecks] = useState<Check[] | null>(null);
   const [done, setDone] = useState(false);
 
   const phoneCheck = checkPhone(phone);
@@ -35,6 +36,7 @@ export default function SetPhoneScreen() {
     setBusy(true);
     setError(null);
     setRows([]);
+    setChecks(null);
     setDone(false);
     try {
       const client = new HtzClient(creds.email.trim(), creds.password);
@@ -44,21 +46,31 @@ export default function SetPhoneScreen() {
         { label: 'app phone', value: rep.appPhone || '(none)', ok: rep.appOk },
         { label: 'web telephone', value: rep.webTelephone || '(none)', ok: rep.webOk },
         { label: 'מייל נוסף (app)', value: rep.appEmail2 || 'empty', ok: rep.email2Ok },
-        { label: 'web write', value: rep.webWritten ? 'applied' : 'already set', ok: true },
+        { label: 'web write', value: rep.webWritten ? 'applied' : 'already set', ok: true, info: true },
       ];
       if (rep.repairs.length) {
-        out.push({ label: 'repaired', value: rep.repairs.join(', '), ok: true });
+        out.push({ label: 'repaired', value: rep.repairs.join(', '), ok: true, info: true });
       }
+      // same split as the desktop tool: other fields are reported, not judged
       out.push({
         label: 'other fields',
         value: rep.changed.length ? rep.changed.join(', ') : 'unchanged',
-        ok: rep.changed.length === 0,
+        ok: true,
+        info: true,
       });
+      if (rep.serverDerived.length) {
+        out.push({ label: 'server-derived', value: rep.serverDerived.join(', '), ok: true, info: true });
+      }
 
       setRows(out);
-      const allOk = out.every((r) => r.ok);
+      const allOk = rep.appOk && rep.webOk && rep.email2Ok;
       setDone(allOk);
-      if (allOk) await creds.persist(creds.email, creds.password);
+      if (allOk) {
+        // same second stage as the desktop tool: prove it with a full sweep
+        const report = await client.verify(phoneCheck.value);
+        setChecks(report.checks);
+        if (report.ok) await creds.persist(creds.email, creds.password);
+      }
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -114,12 +126,36 @@ export default function SetPhoneScreen() {
         {rows.length > 0 && (
           <View style={styles.card}>
             <Text style={[styles.cardTitle, { color: done ? theme.ok : theme.bad }]}>
-              {done ? 'Phone confirmed' : 'Check failed'}
+              {done ? 'Both surfaces written' : 'Check failed'}
             </Text>
             {rows.map((r) => (
               <View key={r.label} style={styles.row}>
                 <Text style={styles.rowLabel}>{r.label}</Text>
-                <Text style={[styles.rowValue, { color: r.ok ? theme.ok : theme.bad }]}>{r.value}</Text>
+                <Text style={[styles.rowValue, { color: r.info ? theme.dim : r.ok ? theme.ok : theme.bad }]}>{r.value}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {checks && (
+          <View style={styles.card}>
+            <Text style={[styles.cardTitle, { color: checks.every((c) => c.info || c.ok) ? theme.ok : theme.bad }]}>
+              {checks.every((c) => c.info || c.ok)
+                ? `Verified — app + web = ${phoneCheck.value}, מייל נוסף empty`
+                : 'Verification failed'}
+            </Text>
+            {checks.map((c, i) => (
+              <View key={`${c.name}-${i}`} style={styles.row}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel}>{c.name}</Text>
+                  {!!c.note && <Text style={styles.hint}>{c.note}</Text>}
+                </View>
+                <Text style={[styles.badge, { color: c.info ? theme.warn : c.ok ? theme.ok : theme.bad, borderColor: c.info ? theme.warn : c.ok ? theme.ok : theme.bad }]}>
+                  {c.info ? 'INFO' : c.ok ? 'PASS' : 'FAIL'}
+                </Text>
+                <Text style={[styles.rowValue, { color: c.info ? theme.warn : c.ok ? theme.ok : theme.bad }]} numberOfLines={1}>
+                  {c.value}
+                </Text>
               </View>
             ))}
           </View>
@@ -275,5 +311,14 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, gap: 12 },
   rowLabel: { color: theme.dim, fontSize: 13, flexShrink: 1 },
   rowValue: { fontSize: 13, fontWeight: '600', flexShrink: 1, textAlign: 'right' },
+  badge: {
+    fontSize: 10,
+    fontWeight: '800',
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    overflow: 'hidden',
+  },
   mono: { color: theme.dim, fontSize: 12, lineHeight: 18 },
 });

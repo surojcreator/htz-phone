@@ -94,7 +94,10 @@ export type DetailsForm = Record<string, string>;
 
 /** fields worth restoring if the web write disturbs them */
 const REPAIRABLE = ['birth_day', 'birth_month', 'city', 'ct_name', 'tz_number', 'first_name', 'last_name'];
-const IGNORE_IN_DIFF = new Set(['last_update', 'date_created', 'home_arr', 'params', 'birthday', 'allow_app_rating']);
+/** server-derived / dynamic: reported but never treated as a failure */
+const VOLATILE = new Set(['last_update', 'date_created', 'home_arr', 'params', 'birthday', 'allow_app_rating']);
+/** a key that names a phone-ish field, same rule the desktop tool uses */
+const PHONE_KEY = /(phone|tel|mobile|cell|whatsapp)/i;
 
 /** Parse the inputs/selects of an HTML form into the values jQuery would serialize. */
 export function parseFormFields(body: string): DetailsForm {
@@ -314,8 +317,13 @@ export class HtzClient {
   }
 
   /**
-   * Full sweep. Uses a fresh app-API session for each read so a cached session
-   * cannot produce a false positive.
+   * Full sweep, mirroring the desktop tool's `verify()`.
+   *
+   * Per app session: the phone, "מייל נוסף", and *every* phone-like key in the
+   * user record (tel/mobile/cell/whatsapp) — a stale number hiding in a second
+   * field is exactly what a whole-object scan is too noisy to catch. Then the
+   * web profile: `telephone` plus any other phone-like form field, and the
+   * additional-email field must be empty.
    */
   async verify(expected: string): Promise<VerifyReport> {
     const checks: Check[] = [];
@@ -330,53 +338,48 @@ export class HtzClient {
         value: String(u.phone ?? ''),
         ok: canon(u.phone) === expect,
       });
-      // `home_arr` is the marketing banner feed — it can echo arbitrary phone
-      // numbers from other users' campaigns, so it must never be scanned.
-      const { home_arr: _feed, params: _params, ...identity } = u as Record<string, any>;
-      const blob = JSON.stringify(identity);
-      for (const stale of STALE_CANDIDATES) {
-        if (stale === expect) continue;
+      const email2 = String(u.email_2 ?? '');
+      checks.push({
+        name: `app API · session ${session} · מייל נוסף empty`,
+        value: email2.trim() ? email2.slice(0, 26) : 'empty',
+        ok: !email2.trim(),
+      });
+      for (const [key, value] of Object.entries(u as Record<string, any>)) {
+        if (key === 'phone' || !PHONE_KEY.test(key)) continue;
+        if (typeof value !== 'string' && typeof value !== 'number') continue;
+        if (!digits(value)) continue;
         checks.push({
-          name: `app API · user object contains ${stale}`,
-          value: String(blob.includes(stale)),
-          ok: !blob.includes(stale),
+          name: `app API · session ${session} · ${key}`,
+          value: String(value),
+          ok: canon(value) === expect,
         });
       }
     }
 
     try {
       await this.webLogin();
-      const { telephone, phone, html } = await this.webReadPhones();
+      const form = await this.webForm();
       checks.push({
         name: 'web · /support_page telephone',
-        value: telephone,
-        ok: canon(telephone) === expect,
+        value: String(form.telephone ?? ''),
+        ok: canon(form.telephone) === expect,
       });
-      checks.push({
-        name: 'web · /support_page phone',
-        value: phone,
-        ok: canon(phone) === expect,
-      });
+      for (const [key, value] of Object.entries(form)) {
+        if (key === 'telephone' || !PHONE_KEY.test(key)) continue;
+        if (!digits(value)) continue;
+        checks.push({
+          name: `web · /support_page ${key}`,
+          value,
+          ok: canon(value) === expect,
+        });
+      }
       // "מייל נוסף" must stay empty on this side too
-      try {
-        const form = await this.webForm();
-        const more = String(form.email_more ?? '');
-        checks.push({
-          name: 'web · /support_page מייל נוסף empty',
-          value: more ? more.slice(0, 24) : 'empty',
-          ok: !more.trim(),
-        });
-      } catch {
-        checks.push({ name: 'web · details form', value: 'unreadable', ok: true, info: true });
-      }
-      for (const stale of STALE_CANDIDATES) {
-        if (stale === expect) continue;
-        checks.push({
-          name: `web · /support_page contains ${stale}`,
-          value: String(html.includes(stale)),
-          ok: !html.includes(stale),
-        });
-      }
+      const more = String(form.email_more ?? '');
+      checks.push({
+        name: 'web · /support_page מייל נוסף empty',
+        value: more.trim() ? more.slice(0, 24) : 'empty',
+        ok: !more.trim(),
+      });
     } catch (e: any) {
       checks.push({
         name: 'web · /support_page',
@@ -486,6 +489,7 @@ export class HtzClient {
     webWritten: boolean;
     repairs: string[];
     changed: string[];
+    serverDerived: string[];
   }> {
     const before = await this.appLogin();
 
@@ -514,7 +518,12 @@ export class HtzClient {
     const webAfter = await this.webForm();
 
     const changed = Object.keys({ ...before, ...after }).filter(
-      (k) => !IGNORE_IN_DIFF.has(k) && k !== 'phone' && k !== 'email_2' &&
+      (k) => !VOLATILE.has(k) && k !== 'phone' && k !== 'email_2' &&
+        JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
+    );
+    // dynamic server data: reported, never a failure (same split as the desktop tool)
+    const serverDerived = Object.keys({ ...before, ...after }).filter(
+      (k) => VOLATILE.has(k) &&
         JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
     );
 
@@ -527,7 +536,8 @@ export class HtzClient {
       webOk: canon(webAfter.telephone) === canon(phone),
       webWritten: !webAlready,
       repairs: Object.keys(repairs),
-      changed,
+      changed: changed.sort(),
+      serverDerived: serverDerived.sort(),
     };
   }
 
@@ -628,11 +638,13 @@ export class HtzClient {
   /** App API partial update — only the fields passed are sent. */
   async appSetPhone(phone: string, extra?: Record<string, string>): Promise<void> {
     const write = async () => {
-      const res = await this.postJson(`${APP_API}editUserInformation/`, {
-        phone,
-        email_2: '',
-        ...(extra ?? {}),
-      });
+      const payload: Record<string, string> = { phone, email_2: '' };
+      // empty values are rejected by the endpoint ("required field"), so they
+      // are dropped the same way the desktop client drops them
+      for (const [k, v] of Object.entries(extra ?? {})) {
+        if (v !== undefined && v !== null && String(v) !== '') payload[k] = String(v);
+      }
+      const res = await this.postJson(`${APP_API}editUserInformation/`, payload);
       if (res?.status !== 1) {
         const err = res?.err ?? {};
         const message = err?.content || JSON.stringify(res).slice(0, 160);
@@ -658,6 +670,6 @@ export class HtzClient {
 }
 
 /** Numbers that must not survive anywhere on the account. */
-export const STALE_CANDIDATES = ['0544464632', '0555073599'];
+export const STALE_CANDIDATES = ['0544464632', '0555073599', '0584248770'];
 
 export { decryptString, encryptString };

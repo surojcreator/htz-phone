@@ -70,6 +70,7 @@ export default function SetPhoneScreen() {
     <KeyboardAvoidingView
       style={styles.flex}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 96 : 0}
     >
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.h1}>Set account phone</Text>
@@ -146,7 +147,7 @@ function RememberRow(props: {
   return (
     <View style={styles.rememberRow}>
       <View style={{ flex: 1 }}>
-        <Text style={styles.label}>Remember email &amp; password</Text>
+        <Text style={styles.label}>Remember email & password</Text>
         <Text style={styles.hint}>{hint}</Text>
       </View>
       {props.state === 'saved' && (
@@ -169,8 +170,9 @@ export function Field(props: {
   value: string;
   onChange: (v: string) => void;
   secure?: boolean;
-  keyboard?: 'default' | 'email-address' | 'phone-pad';
+  keyboard?: 'default' | 'email-address' | 'phone-pad' | 'number-pad';
   autoCap?: 'none' | 'sentences';
+  placeholder?: string;
   error?: string;
 }) {
   const [visible, setVisible] = useState(false);
@@ -188,7 +190,10 @@ export function Field(props: {
           autoCorrect={false}
           autoComplete="off"
           textContentType="none"
+          spellCheck={false}
+          placeholder={props.placeholder}
           placeholderTextColor={theme.dim}
+          returnKeyType="done"
           style={styles.input}
         />
         {props.secure && (

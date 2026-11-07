@@ -50,6 +50,7 @@ export default function VerifyScreen() {
     <KeyboardAvoidingView
       style={styles.flex}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 96 : 0}
     >
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.h1}>Verify phone</Text>
@@ -58,9 +59,9 @@ export default function VerifyScreen() {
           stale number.
         </Text>
 
-        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />
-        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure />
-        <Field label="Expected phone" value={expected} onChange={setExpected} keyboard="phone-pad"
+        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" placeholder="name@company.co.il" />
+        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure placeholder="account password" />
+        <Field label="Expected phone" value={expected} onChange={setExpected} keyboard="phone-pad" placeholder="05XXXXXXXX"
                error={expected.length > 0 && !phoneCheck.ok ? phoneCheck.error : undefined} />
 
         <Pressable

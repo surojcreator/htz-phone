@@ -2,7 +2,7 @@
   "expo": {
     "name": "Htz Phone",
     "slug": "htz-phone",
-    "version": "1.0.8",
+    "version": "1.0.9",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "scheme": "htzphone",
@@ -21,7 +21,7 @@
           "NSAllowsArbitraryLoads": false
         }
       },
-      "buildNumber": "4"
+      "buildNumber": "5"
     },
     "android": {
       "package": "com.htzphone.app",

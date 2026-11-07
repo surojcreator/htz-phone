@@ -6,6 +6,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Switch,
   Text,
@@ -42,17 +43,18 @@ export default function HanukkaScreen() {
     setBusy(true);
     setLines([]);
     setResult(null);
-    const total = Math.max(1, checkInt(repeats, 1, 1));
+    const push = (l: string) => setLines((prev) => (prev.length > 400 ? [...prev.slice(-400), l] : [...prev, l]));
+    const total = Math.min(50, Math.max(1, checkInt(repeats, 1, 1)));
     const gap = checkInt(delay, 1200, 0);
     try {
       const client = new HtzClient(creds.email.trim(), creds.password);
       for (let i = 1; i <= total; i++) {
         if (cancelRef.current) {
-          setLines((prev) => [...prev, '— cancelled —']);
+          push('— cancelled —');
           break;
         }
         setProgress(`${i}/${total}`);
-        setLines((prev) => [...prev, `— run ${i}/${total} —`]);
+        push(`— run ${i}/${total} —`);
         const res = await runHanukka(client, {
           itemId,
           qty: qtyCheck.value,
@@ -60,18 +62,18 @@ export default function HanukkaScreen() {
           collected: variant.trim() || undefined,
           dryRun,
           shouldStop: () => cancelRef.current,
-          log: (l) => setLines((prev) => [...prev, l]),
+          log: push,
         });
         setResult(res);
         if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('&')]);
         if (!res.ok) {
-          setLines((prev) => [...prev, `✗ stopped on run ${i}: ${res.error || 'failed'}`]);
+          push(`✗ stopped on run ${i}: ${res.error || 'failed'}`);
           break;
         }
         if (i < total && gap) await new Promise((r) => setTimeout(r, gap));
       }
     } catch (e: any) {
-      setLines((prev) => [...prev, '✗ ' + (e?.message ?? String(e))]);
+      push('✗ ' + (e?.message ?? String(e)));
     } finally {
       setProgress('');
       setBusy(false);
@@ -80,16 +82,32 @@ export default function HanukkaScreen() {
 
   const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && qtyCheck.ok && !busy;
 
+  async function openCard(url: string) {
+    // Relative or still-escaped URLs make iOS return "cannot open page"
+    const absolute = url.startsWith('//') ? 'https:' + url : url;
+    try {
+      await Linking.openURL(absolute);
+    } catch {
+      await Share.share({ message: absolute, url: absolute }).catch(() => {});
+    }
+  }
+
+  const report = lines.join('\n');
+
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <KeyboardAvoidingView
+      style={styles.flex}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 96 : 0}
+    >
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.h1}>חנוכה order loop</Text>
         <Text style={styles.sub}>
           PRO² show tickets (group 156). Pays with a new card — `payOption=new_card` is forced.
         </Text>
 
-        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />
-        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure />
+        <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" placeholder="name@company.co.il" />
+        <Field label="Password" value={creds.password} onChange={creds.setPassword} secure placeholder="account password" />
 
         <Text style={[styles.label, { marginTop: 16 }]}>Attraction</Text>
         <View style={styles.chips}>
@@ -152,7 +170,7 @@ export default function HanukkaScreen() {
               <ActivityIndicator color="#fff" />
             ) : (
               <Text style={styles.buttonText}>
-                Run חנוכה loop ×{Math.max(1, checkInt(repeats, 1, 1))}
+                Run חנוכה loop ×{Math.min(50, Math.max(1, checkInt(repeats, 1, 1)))}
               </Text>
             )}
           </Pressable>
@@ -189,7 +207,7 @@ export default function HanukkaScreen() {
                   {result.cardUrl}
                 </Text>
                 <Pressable
-                  onPress={() => Linking.openURL(result.cardUrl!).catch(() => {})}
+                  onPress={() => openCard(result.cardUrl!)}
                   style={({ pressed }) => [styles.cardButton, pressed && { opacity: 0.85 }]}
                 >
                   <Text style={styles.cardButtonText}>Open card page</Text>
@@ -201,6 +219,12 @@ export default function HanukkaScreen() {
 
         {lines.length > 0 && (
           <View style={styles.card}>
+            <Pressable
+              onPress={() => Share.share({ message: report }).catch(() => {})}
+              style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
+            >
+              <Text style={styles.shareText}>Share log</Text>
+            </Pressable>
             {lines.map((l, i) => (
               <Text key={i} style={styles.mono} numberOfLines={4}>
                 {l}
@@ -280,5 +304,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   cardButtonText: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  shareButton: {
+    alignSelf: 'flex-start',
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginBottom: 10,
+  },
+  shareText: { color: theme.dim, fontSize: 11.5, fontWeight: '700' },
   mono: { color: theme.dim, fontSize: 11.5, lineHeight: 17 },
 });

@@ -10,7 +10,7 @@
  * checkout page), including `payOption=new_card`, qty on the chosen variant and
  * the order phone.
  */
-import { HtzClient } from './api';
+import { HtzClient, WEB } from './api';
 
 export const HANUKKA_GROUP = '156';
 export const HANUKKA_DEFAULT_ITEM = '166122';
@@ -46,6 +46,14 @@ export type HanukkaResult = {
   raw?: unknown;
 };
 
+/** Scraped iframe sources carry HTML entities and may be relative. */
+function absoluteUrl(raw: string): string {
+  let s = String(raw).trim().replace(/&amp;/gi, '&').replace(/&#0*38;/g, '&').replace(/&quot;/gi, '"');
+  if (s.startsWith('//')) s = 'https:' + s;
+  else if (s.startsWith('/')) s = WEB + s;
+  return s;
+}
+
 /**
  * Classify the pay_order_wallet response.
  *
@@ -62,8 +70,8 @@ export function interpretPayResponse(pay: any): { ok: boolean; relocation?: stri
   if (pay.relocation) return { ok: true, relocation: String(pay.relocation) };
   const html = typeof pay.html === 'string' ? pay.html : '';
   const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-  if (iframe) return { ok: true, cardUrl: iframe[1] };
-  if (typeof pay.url === 'string' && pay.url) return { ok: true, cardUrl: pay.url };
+  if (iframe) return { ok: true, cardUrl: absoluteUrl(iframe[1]) };
+  if (typeof pay.url === 'string' && pay.url) return { ok: true, cardUrl: absoluteUrl(pay.url) };
   return { ok: false, error: 'unrecognised response' };
 }
 

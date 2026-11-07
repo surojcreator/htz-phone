@@ -43,6 +43,18 @@ const canon = (s: unknown) => {
   return d.startsWith('972') ? `0${d.slice(3)}` : d;
 };
 
+/**
+ * React Native (iOS NSURLSession / Android OkHttp) keeps a real cookie store
+ * and applies it whenever a request opts in with `credentials: 'include'`.
+ * Sending our own mirrored `Cookie` header on top of that makes the platform
+ * append a *second* PHPSESSID — when the server rotates the session, the stale
+ * copy can win and every authenticated call answers 150 "must be logged in"
+ * (the iOS symptom). So the mirror is only used where there is no store at all:
+ * the Node harness.
+ */
+const IS_NATIVE =
+  typeof navigator !== 'undefined' && (navigator as any).product === 'ReactNative';
+
 async function withTimeout<T>(
   run: Promise<T> | ((signal?: AbortSignal) => Promise<T>),
   ms: number,
@@ -58,6 +70,9 @@ async function withTimeout<T>(
   try {
     // call sites may pass a promise (no abort) or a function that accepts the signal
     const started = typeof run === 'function' ? (run as (s?: AbortSignal) => Promise<T>)(ctrl?.signal) : run;
+    // when the timeout wins, the aborted fetch still rejects later — keep that
+    // rejection handled so Hermes/JSC doesn't surface it as an app error
+    started.catch(() => {});
     return await Promise.race([started, timeout]);
   } finally {
     clearTimeout(timer!);
@@ -152,6 +167,7 @@ export class HtzClient {
   }
 
   private cookieHeaderFor(url: string): string | undefined {
+    if (IS_NATIVE) return undefined; // the platform store owns the session
     const prefix = HtzClient.hostOf(url) + '|';
     const parts = Object.entries(this.jar)
       .filter(([k]) => k.startsWith(prefix))
@@ -198,19 +214,38 @@ export class HtzClient {
     }
   }
 
+  /**
+   * GET that survives one transient network failure (iOS Wi-Fi/cellular
+   * handoff and DNS hiccups otherwise surface as "Network request failed"
+   * in the middle of a verification run). Only used for idempotent reads.
+   */
+  private async getText(url: string, extra: Record<string, string> = {}): Promise<string> {
+    const headers: Record<string, string> = { Accept: 'text/html,application/xhtml+xml', ...extra };
+    const cookie = this.cookieHeaderFor(url);
+    if (cookie) headers.Cookie = cookie;
+
+    let lastErr: any;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await withTimeout(
+          fetch(url, { headers, credentials: 'include' }),
+          25000,
+        );
+        this.absorb(res, url);
+        return await res.text();
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+    throw lastErr;
+  }
+
   /** Web login: needs the inline secure_login token from /login. */
   async webLogin(): Promise<void> {
     const loginUrl = `${WEB}/login`;
     const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
-    const pageRes = await withTimeout(
-      fetch(loginUrl, {
-        headers: this.cookieHeaderFor(loginUrl) ? { Cookie: this.cookieHeaderFor(loginUrl)! } : {},
-        credentials: 'include',
-      }),
-      25000,
-    );
-    this.absorb(pageRes, loginUrl);
-    const page = await pageRes.text();
+    const page = await this.getText(loginUrl);
     const m = page.match(/var\s+secure_login\s*=\s*"([^"]+)"/);
     if (!m) throw new Error('secure_login token not found on /login');
 
@@ -251,29 +286,31 @@ export class HtzClient {
     }
   }
 
-  /** Web read: both phone-ish inputs in the details form. */
+  /** Both phone-ish inputs in the details form. Re-logs in once if the session lapsed. */
   async webReadPhones(): Promise<{ telephone: string; phone: string; html: string }> {
-    const pageUrl = `${WEB}/support_page`;
-    const res = await withTimeout(
-      fetch(pageUrl, {
-        headers: this.cookieHeaderFor(pageUrl) ? { Cookie: this.cookieHeaderFor(pageUrl)! } : {},
-        credentials: 'include',
-      }),
-      25000,
-    );
-    this.absorb(res, pageUrl);
-    const html = await res.text();
-    // The details form lives inside a JSON-escaped HTML string. Unescape the
-    // quotes once, then match conventionally — and anchor `value=` so
-    // `data-value=` can never win the match.
-    const flat = html.replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-    const read = (field: string) => {
-      const tag = flat.match(new RegExp(`<input[^>]*\\bname=['"]${field}['"][^>]*>`));
-      if (!tag) return '';
-      const v = tag[0].match(/(?:^|\s)value\s*=\s*['"]([^'"]*)/);
-      return v ? v[1] : '';
+    const once = async () => {
+      const pageUrl = `${WEB}/support_page`;
+      const html = await this.getText(pageUrl);
+      // The details form lives inside a JSON-escaped HTML string. Unescape the
+      // quotes once, then match conventionally — and anchor `value=` so
+      // `data-value=` can never win the match.
+      const flat = html.replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+      const read = (field: string) => {
+        const tag = flat.match(new RegExp(`<input[^>]*\\bname=['"]${field}['"][^>]*>`));
+        if (!tag) return '';
+        const v = tag[0].match(/(?:^|\s)value\s*=\s*['"]([^'"]*)/);
+        return v ? v[1] : '';
+      };
+      return { telephone: read('telephone'), phone: read('phone'), html };
     };
-    return { telephone: read('telephone'), phone: read('phone'), html };
+
+    let out = await once();
+    if (!out.telephone && !out.phone) {
+      // page rendered but the form wasn't ours: the session is gone
+      await this.webLogin();
+      out = await once();
+    }
+    return out;
   }
 
   /**
@@ -355,6 +392,16 @@ export class HtzClient {
 
   /** Every serializable field of the /support_page "my details" form. */
   async webForm(): Promise<DetailsForm> {
+    try {
+      return await this.readDetailsForm();
+    } catch {
+      // a lapsed session renders the page without our details block
+      await this.webLogin();
+      return this.readDetailsForm();
+    }
+  }
+
+  private async readDetailsForm(): Promise<DetailsForm> {
     const html = await this.webGet('/support_page');
     const anchor = html.indexOf('"next_step":"details_form"');
     if (anchor < 0) throw new Error('details form marker not found on /support_page');
@@ -503,19 +550,7 @@ export class HtzClient {
   /** Raw web GET through the same session (cookies included). */
   async webGet(path: string): Promise<string> {
     const url = path.startsWith('http') ? path : WEB + path;
-    const res = await withTimeout(
-      fetch(url, {
-        headers: {
-          ...(this.cookieHeaderFor(url) ? { Cookie: this.cookieHeaderFor(url)! } : {}),
-          Accept: 'text/html,application/xhtml+xml',
-          Referer: `${WEB}/`,
-        },
-        credentials: 'include',
-      }),
-      30000,
-    );
-    this.absorb(res, url);
-    return res.text();
+    return this.getText(url, { Referer: `${WEB}/` });
   }
 
   /**

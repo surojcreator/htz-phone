@@ -23,6 +23,8 @@ export default function HanukkaScreen() {
   const [qty, setQty] = useState('4');
   const [phone, setPhone] = useState('0555073599');
   const [variant, setVariant] = useState('');
+  const [repeats, setRepeats] = useState('1');
+  const [delay, setDelay] = useState('1200');
   const [dryRun, setDryRun] = useState(true);
   const [busy, setBusy] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
@@ -32,18 +34,28 @@ export default function HanukkaScreen() {
     setBusy(true);
     setLines([]);
     setResult(null);
+    const total = Math.max(1, parseInt(repeats, 10) || 1);
+    const gap = Math.max(0, parseInt(delay, 10) || 0);
     try {
       const client = new HtzClient(creds.email.trim(), creds.password);
-      const res = await runHanukka(client, {
-        itemId,
-        qty: parseInt(qty, 10) || 4,
-        phone,
-        collected: variant.trim() || undefined,
-        dryRun,
-        log: (l) => setLines((prev) => [...prev, l]),
-      });
-      setResult(res);
-      if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('&')]);
+      for (let i = 1; i <= total; i++) {
+        setLines((prev) => [...prev, `— run ${i}/${total} —`]);
+        const res = await runHanukka(client, {
+          itemId,
+          qty: parseInt(qty, 10) || 4,
+          phone,
+          collected: variant.trim() || undefined,
+          dryRun,
+          log: (l) => setLines((prev) => [...prev, l]),
+        });
+        setResult(res);
+        if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('&')]);
+        if (!res.ok) {
+          setLines((prev) => [...prev, `✗ stopped on run ${i}: ${res.error || 'failed'}`]);
+          break;
+        }
+        if (i < total && gap) await new Promise((r) => setTimeout(r, gap));
+      }
     } catch (e: any) {
       setLines((prev) => [...prev, '✗ ' + (e?.message ?? String(e))]);
     } finally {
@@ -79,6 +91,8 @@ export default function HanukkaScreen() {
 
         <Field label="Qty (allowance 4)" value={qty} onChange={setQty} keyboard="phone-pad" />
         <Field label="Order phone" value={phone} onChange={setPhone} keyboard="phone-pad" />
+        <Field label="Repeats" value={repeats} onChange={setRepeats} keyboard="phone-pad" />
+        <Field label="Delay between repeats (ms)" value={delay} onChange={setDelay} keyboard="phone-pad" />
         <Field
           label="Variant (blank = first class)"
           value={variant}
@@ -101,7 +115,7 @@ export default function HanukkaScreen() {
           disabled={!canRun}
           style={({ pressed }) => [styles.button, !canRun && styles.buttonDisabled, pressed && { opacity: 0.85 }]}
         >
-          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Run חנוכה loop</Text>}
+          {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Run חנוכה loop ×{Math.max(1, parseInt(repeats, 10) || 1)}</Text>}
         </Pressable>
 
         {result && (

@@ -47,16 +47,16 @@ const canon = (s: unknown) => {
 };
 
 /**
- * React Native (iOS NSURLSession / Android OkHttp) keeps a real cookie store
- * and applies it whenever a request opts in with `credentials: 'include'`.
- * Sending our own mirrored `Cookie` header on top of that makes the platform
- * append a *second* PHPSESSID — when the server rotates the session, the stale
- * copy can win and every authenticated call answers 150 "must be logged in"
- * (the iOS symptom). So the mirror is only used where there is no store at all:
- * the Node harness.
+ * Cookies: we keep our own jar and tell fetch not to use the platform store.
+ *
+ * `secure_login` is bound to whichever PHPSESSID fetched /login, so the page
+ * fetch and the POST must travel with the *same* cookie. Letting NSURLSession /
+ * OkHttp add theirs produced a second PHPSESSID and, whenever the server saw
+ * the other one, the site answered "מייל או סיסמא לא נכונים" for a valid password.
  */
 const IS_NATIVE =
   typeof navigator !== 'undefined' && (navigator as any).product === 'ReactNative';
+void IS_NATIVE;
 
 async function withTimeout<T>(
   run: Promise<T> | ((signal?: AbortSignal) => Promise<T>),
@@ -151,20 +151,44 @@ export function parseFormFields(body: string): DetailsForm {
 
 export class HtzClient {
   /**
-   * Cookies are handled natively by RN (OkHttp / NSURLSession). Node's fetch has
-   * no jar, so we mirror Set-Cookie ourselves and send it back explicitly —
-   * harmless in RN, required for the headless harness.
+   * Cookies are managed here, not by the platform.
+   *
+   * Two reasons, both learned the hard way:
+   *
+   * 1. `secure_login` is bound to the PHPSESSID that fetched /login. If the
+   *    cookie that arrives with the POST differs from the one that fetched the
+   *    page — which is what happens when the platform store and our jar each
+   *    send their own — the site answers "מייל או סיסמא לא נכונים" even though
+   *    the password is right.
+   * 2. A stuck session can only be cleared by dropping the cookie. The platform
+   *    store can't be cleared from JS, which is why the old build needed a
+   *    reinstall. Here `resetSession()` mints a new PHPSESSID instead.
+   *
+   * Cookies are keyed by host: cms.htzone.co.il and www.htzone.co.il issue
+   * separate PHPSESSIDs and must never be mixed.
    */
-  /**
-   * Cookies are keyed by host: `cms.htzone.co.il` and `www.htzone.co.il` issue
-   * separate PHPSESSIDs, and sending the API's session to the website (or the
-   * reverse) makes a valid login look like "מייל או סיסמא לא נכונים".
-   */
-  private jar: Record<string, string> = {};
-  /** when the web session was last established (ms), 0 = unknown */
-  private webAt = 0;
+
+  /** Shared per account so a fresh screen doesn't log in again. */
+  private static sessions = new Map<string, { jar: Record<string, string>; webAt: number }>();
+
+  private get sess() {
+    const key = this.email.trim().toLowerCase();
+    let s = HtzClient.sessions.get(key);
+    if (!s) {
+      s = { jar: {}, webAt: 0 };
+      HtzClient.sessions.set(key, s);
+    }
+    return s;
+  }
 
   constructor(public email: string, public password: string) {}
+
+  /** Drop every cookie for this account — the "reinstall" equivalent. */
+  resetSession(): void {
+    const s = this.sess;
+    s.jar = {};
+    s.webAt = 0;
+  }
 
   private static hostOf(url: string): string {
     try {
@@ -175,12 +199,29 @@ export class HtzClient {
   }
 
   private cookieHeaderFor(url: string): string | undefined {
-    if (IS_NATIVE) return undefined; // the platform store owns the session
     const prefix = HtzClient.hostOf(url) + '|';
-    const parts = Object.entries(this.jar)
+    const parts = Object.entries(this.sess.jar)
       .filter(([k]) => k.startsWith(prefix))
       .map(([k, v]) => `${k.slice(prefix.length)}=${v}`);
     return parts.length ? parts.join('; ') : undefined;
+  }
+
+  /** PHP accepts a client-supplied id, so a fresh one is a fresh session. */
+  private static newSessionId(): string {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let id = '';
+    for (let i = 0; i < 26; i++) id += alphabet[Math.floor(Math.random() * alphabet.length)];
+    return id;
+  }
+
+  private mintWebSession(): void {
+    const s = this.sess;
+    // keep unrelated cookies, replace the session id
+    for (const k of Object.keys(s.jar)) {
+      if (k.startsWith('www.htzone.co.il|PHPSESSID')) delete s.jar[k];
+    }
+    s.jar['www.htzone.co.il|PHPSESSID'] = HtzClient.newSessionId();
+    s.webAt = 0;
   }
 
   private absorb(res: Response, url: string) {
@@ -189,7 +230,7 @@ export class HtzClient {
       typeof h.getSetCookie === 'function' ? h.getSetCookie() : [h.get('set-cookie')].filter(Boolean);
     const prefix = HtzClient.hostOf(url) + '|';
     for (const one of raw) {
-      for (const [k, v] of Object.entries(parseSetCookie(one))) this.jar[prefix + k] = v;
+      for (const [k, v] of Object.entries(parseSetCookie(one))) this.sess.jar[prefix + k] = v;
     }
   }
 
@@ -209,7 +250,7 @@ export class HtzClient {
         // React Native only attaches/stores cookies when the request opts in.
         // Without this the login succeeds but the follow-up call has no session
         // (the app API answers 150 "must be logged in").
-        credentials: 'include',
+        credentials: 'omit',
       }),
       25000,
     );
@@ -236,7 +277,7 @@ export class HtzClient {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await withTimeout(
-          fetch(url, { headers, credentials: 'include' }),
+          fetch(url, { headers, credentials: 'omit' }),
           25000,
         );
         this.absorb(res, url);
@@ -251,69 +292,84 @@ export class HtzClient {
 
   /** Web login: needs the inline secure_login token from /login. */
   async webLogin(): Promise<void> {
-    const loginUrl = `${WEB}/login`;
     const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
+    let lastPage = '';
+    let lastErr = '';
 
-    // The token is per page load and the site drops it when it is throttling
-    // or serving a challenge page — which is exactly what "secure_login token
-    // not found" after a while means. Fetch with a cache-buster and retry with
-    // backoff instead of failing the whole run on the first empty page.
-    let token: string | null = null;
-    let page = '';
-    for (let attempt = 0; attempt < 3 && !token; attempt++) {
-      const url = `${loginUrl}?_=${Date.now()}${attempt ? `&r=${attempt}` : ''}`;
-      page = await this.getText(url);
-      token = HtzClient.tokenFrom(page);
-      if (!token && attempt < 2) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      // A fresh session id on the first two attempts: it is the only reliable
+      // way to escape a session the site has decided to stop issuing tokens for
+      // (previously a reinstall was the workaround — this is the same thing).
+      if (attempt < 2) this.mintWebSession();
+
+      const loginUrl = `${WEB}/login?_=${Date.now()}&a=${attempt}`;
+      try {
+        lastPage = await this.getText(loginUrl);
+      } catch (e: any) {
+        lastErr = e?.message ?? String(e);
         await new Promise((r) => setTimeout(r, 700 * (attempt + 1) ** 2));
+        continue;
       }
-    }
-    if (!token) {
-      this.webAt = 0;
-      const challenged = /captcha|recaptcha|too many|rate.?limit|\u05d7\u05e1\u05d5\u05dd|\u05d1\u05d5\u05d8/i.test(page) || page.length < 3000;
-      throw new Error(
-        'secure_login token not found on /login (' + page.length + ' B, 3 tries)' +
-          (challenged ? ' — the site is throttling this connection or asking for a challenge; wait a minute and retry' : ''),
+
+      const token = HtzClient.tokenFrom(lastPage);
+      if (!token) {
+        lastErr = 'token missing';
+        await new Promise((r) => setTimeout(r, 700 * (attempt + 1) ** 2));
+        continue;
+      }
+
+      const form = new URLSearchParams({
+        email: this.email,
+        password: this.password,
+        remember: 'on',
+        secure_login: token,
+        file: 'user_service',
+        action: 'login',
+      });
+
+      const res = await withTimeout(
+        fetch(ajaxUrl, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json, text/javascript, */*; q=0.01',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            Referer: loginUrl,
+            Origin: WEB,
+            ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
+          },
+          body: form.toString(),
+          credentials: 'omit',
+        }),
+        25000,
       );
+      this.absorb(res, ajaxUrl);
+      const json = await res.json().catch(() => ({}));
+      const webErr = String(json?.err ?? '').trim();
+
+      if (!webErr) {
+        this.sess.webAt = Date.now();
+        return;
+      }
+
+      lastErr = webErr;
+      // "wrong password" is also what a token/session mismatch looks like, so
+      // one retry with a brand-new session is worth it; after that it is real.
+      if (!/לא נכונים/.test(webErr) || attempt >= 1) break;
+      await new Promise((r) => setTimeout(r, 800));
     }
 
-    const form = new URLSearchParams({
-      email: this.email,
-      password: this.password,
-      remember: 'on',
-      secure_login: token,
-      file: 'user_service',
-      action: 'login',
-    });
-
-    const res = await withTimeout(
-      fetch(ajaxUrl, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json, text/javascript, */*; q=0.01',
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-          Referer: loginUrl,
-          Origin: WEB,
-          ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
-        },
-        body: form.toString(),
-        credentials: 'include',
-      }),
-      25000,
-    );
-    this.absorb(res, ajaxUrl);
-    const json = await res.json();
-    const webErr = (json?.err ?? '').toString().trim();
-    if (webErr) {
-      this.webAt = 0;
-      // the site uses one generic message for several causes
-      const hint = /לא נכונים/.test(webErr)
-        ? ' — the site rejected the credentials: check the password (press Forget and retype it), and note that repeated attempts can be rate-limited'
-        : '';
-      throw new Error(`web login failed: ${webErr}${hint}`);
-    }
-    this.webAt = Date.now();
+    this.sess.webAt = 0;
+    const challenged =
+      /captcha|recaptcha|too many|rate.?limit|\u05d7\u05e1\u05d5\u05dd|\u05d1\u05d5\u05d8/i.test(lastPage) ||
+      (!!lastPage && lastPage.length < 3000);
+    const why = /לא נכונים/.test(lastErr)
+      ? `web login failed: ${lastErr} — the site rejected the credentials (or this session). Press Reset session in Defaults and try again; if it repeats, check the password.`
+      : `secure_login token not found on /login (${lastPage.length} B, 4 tries)` +
+        (challenged
+          ? ' — the site is throttling this connection or asking for a challenge; wait a minute and retry'
+          : ` — last error: ${lastErr || 'none'}`);
+    throw new Error(why);
   }
 
   /** The token appears in a few spellings depending on the page variant. */
@@ -338,7 +394,7 @@ export class HtzClient {
    * healthy session into "secure_login token not found" later in the day.
    */
   async ensureWebSession(force = false): Promise<void> {
-    if (!force && this.webAt && Date.now() - this.webAt < 5 * 60_000) return;
+    if (!force && this.sess.webAt && Date.now() - this.sess.webAt < 10 * 60_000) return;
     await this.webLogin();
   }
 
@@ -675,7 +731,7 @@ export class HtzClient {
           ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
         },
         body: encoded,
-        credentials: 'include',
+        credentials: 'omit',
       }),
       30000,
     );
@@ -703,7 +759,7 @@ export class HtzClient {
           ...(this.cookieHeaderFor(ajaxUrl) ? { Cookie: this.cookieHeaderFor(ajaxUrl)! } : {}),
         },
         body,
-        credentials: 'include',
+        credentials: 'omit',
       }),
       30000,
     );

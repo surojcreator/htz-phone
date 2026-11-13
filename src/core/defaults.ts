@@ -68,7 +68,7 @@ export function normalize(raw: any): Defaults {
     itemId: str(r.itemId, BUILT_IN.itemId).trim() || BUILT_IN.itemId,
     variant: str(r.variant, BUILT_IN.variant),
     qty: clampInt(r.qty, BUILT_IN.qty, 1, 20),
-    repeats: clampInt(r.repeats, BUILT_IN.repeats, 1, 50),
+    repeats: clampInt(r.repeats, BUILT_IN.repeats, 1, 10000),
     delay: clampInt(r.delay, BUILT_IN.delay, 0, 600000),
     dryRun: typeof r.dryRun === 'boolean' ? r.dryRun : BUILT_IN.dryRun,
     background: typeof r.background === 'boolean' ? r.background : BUILT_IN.background,

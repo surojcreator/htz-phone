@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Linking,
   Platform,
@@ -10,8 +11,11 @@ import {
   StyleSheet,
   Switch,
   Text,
+  Vibration,
   View,
 } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
 import { HtzClient } from '../core/api';
 import { HANUKKA_ITEMS, HanukkaResult, newHanukkaSession, runHanukka } from '../core/hanukka';
@@ -24,7 +28,7 @@ import { Field } from './SetPhoneScreen';
 
 export default function HanukkaScreen() {
   const creds = useCreds();
-  const { defaults, loaded } = useDefaults();
+  const { defaults, loaded, patch } = useDefaults();
   const [itemId, setItemId] = useState(HANUKKA_ITEMS[0].id);
   const [qty, setQty] = useState('4');
   const [phone, setPhone] = useState('0555073599');
@@ -36,6 +40,7 @@ export default function HanukkaScreen() {
   const [background, setBackground] = useState(true);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
+  const [continueOnError, setContinueOnError] = useState(false);
   const [lines, setLines] = useState<string[]>([]);
   const [result, setResult] = useState<HanukkaResult | null>(null);
   const cancelRef = useRef(false);
@@ -63,11 +68,19 @@ export default function HanukkaScreen() {
     setBusy(true);
     setLines([]);
     setResult(null);
-    const push = (l: string) => setLines((prev) => (prev.length > 400 ? [...prev.slice(-400), l] : [...prev, l]));
-    const total = Math.min(50, Math.max(1, checkInt(repeats, 1, 1)));
+    const push = (l: string) => setLines((prev) => (prev.length > 800 ? [...prev.slice(-800), l] : [...prev, l]));
+    const total = Math.min(10000, Math.max(1, checkInt(repeats, 1, 1)));
     const gap = checkInt(delay, 1200, 0);
+    const started = Date.now();
+    let done = 0;
+    let failed = 0;
     let keptAlive = false;
+    let awake = false;
     try {
+      try {
+        await activateKeepAwakeAsync('htz-run');
+        awake = true;
+      } catch { /* screen may still sleep; the loop keeps running anyway */ }
       if (background) {
         keptAlive = await startKeepAlive();
         push(keptAlive
@@ -81,7 +94,8 @@ export default function HanukkaScreen() {
           push('— cancelled —');
           break;
         }
-        setProgress(`${i}/${total}`);
+        const eta = done > 0 ? Math.round(((Date.now() - started) / done) * (total - done) / 1000) : 0;
+        setProgress(`${i}/${total}` + (done > 0 ? ` · ${failed} failed · ~${eta}s left` : ''));
         push(`— run ${i}/${total} —`);
         const res = await runHanukka(client, {
           itemId,
@@ -96,22 +110,69 @@ export default function HanukkaScreen() {
         });
         setResult(res);
         if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('&')]);
+        done++;
         if (!res.ok) {
-          push(`✗ stopped on run ${i}: ${res.error || 'failed'}`);
-          break;
+          failed++;
+          push(`✗ run ${i} failed: ${res.error || 'failed'}`);
+          if (!continueOnError) {
+            push('— stopping (continue-on-error is off) —');
+            break;
+          }
+          push('— continuing —');
         }
         if (i < total && gap) await new Promise((r) => setTimeout(r, gap));
       }
+      push(`— finished: ${done - failed}/${total} ok in ${Math.round((Date.now() - started) / 1000)}s —`);
     } catch (e: any) {
       push('✗ ' + (e?.message ?? String(e)));
     } finally {
       if (keptAlive) await stopKeepAlive();
+      if (awake) { try { deactivateKeepAwake('htz-run'); } catch { /* ignore */ } }
+      if (done > 0) {
+        Vibration.vibrate(Platform.OS === 'ios' ? [0, 60, 80, 60] : [0, 120, 80, 120]);
+      }
       setProgress('');
       setBusy(false);
     }
   }
 
+  async function saveAsDefaults() {
+    await patch({
+      itemId,
+      variant: variant.trim(),
+      qty: qtyCheck.value,
+      orderPhone: phoneCheck.value,
+      repeats: Math.min(10000, Math.max(1, checkInt(repeats, 1, 1))),
+      delay: checkInt(delay, 1200, 0),
+      dryRun,
+      background,
+    });
+    setLines((prev) => [...prev, '· current values saved as defaults']);
+  }
+
+  async function copyLog() {
+    await Clipboard.setStringAsync(report).catch(() => {});
+    setLines((prev) => [...prev, '· log copied to clipboard']);
+  }
+
   const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && qtyCheck.ok && !busy;
+
+  function confirmAndRun() {
+    const total = Math.min(10000, Math.max(1, checkInt(repeats, 1, 1)));
+    if (dryRun) {
+      void run();
+      return;
+    }
+    Alert.alert(
+      'Place real orders?',
+      `${total} order(s) of ${qtyCheck.value} × ${itemId} with phone ${phoneCheck.value}.\n` +
+        'Payment is left at the card step (new_card).',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Run', style: 'destructive', onPress: () => void run() },
+      ],
+    );
+  }
 
   async function openCard(url: string) {
     // Relative or still-escaped URLs make iOS return "cannot open page"
@@ -167,7 +228,7 @@ export default function HanukkaScreen() {
           keyboard="phone-pad"
           error={phone.length > 0 && !phoneCheck.ok ? phoneCheck.error : undefined}
         />
-        <Field label="Repeats" value={repeats} onChange={setRepeats} keyboard="phone-pad" />
+        <Field label="Repeats (max 10000)" value={repeats} onChange={setRepeats} keyboard="phone-pad" />
         <Field label="Delay between repeats (ms)" value={delay} onChange={setDelay} keyboard="phone-pad" />
         <Field
           label="Variant (blank = first class)"
@@ -213,9 +274,19 @@ export default function HanukkaScreen() {
           Android: same trick — set the app to Unrestricted battery use for long batches.
         </Text>
 
+        <View style={styles.switchRow}>
+          <Text style={[styles.label, { flex: 1 }]}>Continue after a failed run</Text>
+          <Switch
+            value={continueOnError}
+            onValueChange={setContinueOnError}
+            trackColor={{ true: theme.accent, false: theme.border }}
+            thumbColor="#fff"
+          />
+        </View>
+
         <View style={styles.actionRow}>
           <Pressable
-            onPress={run}
+            onPress={confirmAndRun}
             disabled={!canRun}
             style={({ pressed }) => [
               styles.button,
@@ -228,7 +299,8 @@ export default function HanukkaScreen() {
               <ActivityIndicator color="#fff" />
             ) : (
               <Text style={styles.buttonText}>
-                Run חנוכה loop ×{Math.min(50, Math.max(1, checkInt(repeats, 1, 1)))}
+                Run חנוכה loop ×{Math.min(10000, Math.max(1, checkInt(repeats, 1, 1)))}
+                {dryRun ? ' (dry)' : ''}
               </Text>
             )}
           </Pressable>
@@ -277,14 +349,28 @@ export default function HanukkaScreen() {
 
         {lines.length > 0 && (
           <View style={styles.card}>
-            <Pressable
-              onPress={() => Share.share({ message: report }).catch(() => {})}
-              style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
-            >
-              <Text style={styles.shareText}>Share log</Text>
-            </Pressable>
+            <View style={styles.logActions}>
+              <Pressable
+                onPress={copyLog}
+                style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
+              >
+                <Text style={styles.shareText}>Copy log</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => Share.share({ message: report }).catch(() => {})}
+                style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
+              >
+                <Text style={styles.shareText}>Share log</Text>
+              </Pressable>
+              <Pressable
+                onPress={saveAsDefaults}
+                style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
+              >
+                <Text style={styles.shareText}>Save as defaults</Text>
+              </Pressable>
+            </View>
             {lines.map((l, i) => (
-              <Text key={i} style={styles.mono} numberOfLines={4}>
+              <Text key={i} style={styles.mono} selectable numberOfLines={4}>
                 {l}
               </Text>
             ))}
@@ -371,6 +457,7 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     marginBottom: 10,
   },
+  logActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   shareText: { color: theme.dim, fontSize: 11.5, fontWeight: '700' },
   mono: { color: theme.dim, fontSize: 11.5, lineHeight: 17 },
 });

@@ -2,13 +2,16 @@ import React, { useEffect, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 
 import { checkPhone, checkQty } from '../core/format';
+import { HtzClient } from '../core/api';
 import { BUILT_IN, RUN_MODES } from '../core/defaults';
 import { theme } from '../ui/theme';
+import { useCreds } from '../ui/credentials';
 import { useDefaults } from '../ui/defaults';
 import { Field } from './SetPhoneScreen';
 
 export default function SettingsScreen() {
   const { defaults, loaded, patch, reset, savedAt } = useDefaults();
+  const creds = useCreds();
 
   const [phone, setPhone] = useState(defaults.phone);
   const [orderPhone, setOrderPhone] = useState(defaults.orderPhone);
@@ -88,6 +91,16 @@ export default function SettingsScreen() {
 
   const mark = () => setTouched(true);
 
+  async function resetSession() {
+    const email = creds.email.trim();
+    if (!email) {
+      setNotice('enter the account email on the Set phone tab first');
+      return;
+    }
+    new HtzClient(email, creds.password).resetSession();
+    setNotice('session cleared — the next run logs in with a fresh session');
+  }
+
   return (
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <Text style={styles.h1}>Defaults</Text>
@@ -134,12 +147,12 @@ export default function SettingsScreen() {
         error={qty.length > 0 && !qtyCheck.ok ? qtyCheck.error : undefined}
       />
       <Field
-        label="Repeats (max 50)"
+        label="Repeats (max 10000)"
         value={repeats}
         onChange={(v) => { mark(); setRepeats(v); }}
         keyboard="number-pad"
         placeholder={String(BUILT_IN.repeats)}
-        error={repeats.length > 0 && !repeatsOk ? '1 to 50' : undefined}
+        error={repeats.length > 0 && !repeatsOk ? '1 to 10000' : undefined}
       />
       <Field
         label="Delay between repeats (ms)"
@@ -204,6 +217,19 @@ export default function SettingsScreen() {
       <Text style={[styles.notice, { marginTop: 6 }]}>
         stored in the keychain / keystore, next to the credentials
       </Text>
+
+      <View style={styles.divider} />
+      <Text style={styles.label}>Session</Text>
+      <Text style={[styles.notice, { marginTop: 4 }]}>
+        Drops the stored website session and mints a new one on the next request. This is what
+        reinstalling the app used to do — use it when login starts failing.
+      </Text>
+      <Pressable
+        onPress={resetSession}
+        style={({ pressed }) => [styles.ghost, { marginTop: 10, paddingVertical: 12 }, pressed && { opacity: 0.85 }]}
+      >
+        <Text style={styles.ghostText}>Reset session</Text>
+      </Pressable>
     </ScrollView>
   );
 }
@@ -258,4 +284,5 @@ const styles = StyleSheet.create({
   },
   ghostText: { color: theme.dim, fontSize: 14, fontWeight: '700' },
   notice: { color: theme.dim, fontSize: 12, marginTop: 12 },
+  divider: { height: StyleSheet.hairlineWidth, backgroundColor: theme.border, marginTop: 26, marginBottom: 18 },
 });

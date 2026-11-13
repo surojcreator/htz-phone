@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -14,11 +14,13 @@ import { Check, HtzClient } from '../core/api';
 import { checkPhone } from '../core/format';
 import { theme } from '../ui/theme';
 import { useCreds } from '../ui/credentials';
+import { useDefaults } from '../ui/defaults';
 import { Field } from './SetPhoneScreen';
 
 export default function VerifyScreen() {
   const creds = useCreds();
-  const [expected, setExpected] = useState('0555071161');
+  const { defaults, loaded } = useDefaults();
+  const [expected, setExpected] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [checks, setChecks] = useState<Check[] | null>(null);
@@ -26,6 +28,13 @@ export default function VerifyScreen() {
 
   const phoneCheck = checkPhone(expected);
   const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && !busy;
+
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!loaded || seeded.current) return;
+    seeded.current = true;
+    setExpected(defaults.phone);
+  }, [loaded]);
 
   async function run() {
     setBusy(true);

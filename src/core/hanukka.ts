@@ -218,7 +218,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     if (sessionReady) {
       add('web login', true, `reused session (${client.email})`);
     } else {
-      await client.webLogin();
+      await client.ensureWebSession();
       if (sess) sess.loggedIn = true;
       add('web login', true, client.email);
     }
@@ -327,7 +327,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     // "must be logged in". Re-authenticate and retry the cart once.
     if (addRes && addRes.status !== 1 && sessionReady && /מחובר|התחבר|login/i.test(errText(addRes))) {
       log('… session lapsed, logging in again');
-      await client.webLogin();
+      await client.ensureWebSession(true);
       await signIn(proj);
       addRes = await addToCart();
       add('web login', true, 're-authenticated');

@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -19,10 +19,12 @@ import { startKeepAlive, stopKeepAlive } from '../core/keepAlive';
 import { checkInt, checkPhone, checkQty } from '../core/format';
 import { theme } from '../ui/theme';
 import { useCreds } from '../ui/credentials';
+import { useDefaults } from '../ui/defaults';
 import { Field } from './SetPhoneScreen';
 
 export default function HanukkaScreen() {
   const creds = useCreds();
+  const { defaults, loaded } = useDefaults();
   const [itemId, setItemId] = useState(HANUKKA_ITEMS[0].id);
   const [qty, setQty] = useState('4');
   const [phone, setPhone] = useState('0555073599');
@@ -37,6 +39,21 @@ export default function HanukkaScreen() {
   const [lines, setLines] = useState<string[]>([]);
   const [result, setResult] = useState<HanukkaResult | null>(null);
   const cancelRef = useRef(false);
+  const seeded = useRef(false);
+
+  // defaults from the Defaults tab, applied once
+  useEffect(() => {
+    if (!loaded || seeded.current) return;
+    seeded.current = true;
+    setItemId(defaults.itemId || HANUKKA_ITEMS[0].id);
+    setQty(String(defaults.qty));
+    setPhone(defaults.orderPhone);
+    setVariant(defaults.variant);
+    setRepeats(String(defaults.repeats));
+    setDelay(String(defaults.delay));
+    setDryRun(defaults.dryRun);
+    setBackground(defaults.background);
+  }, [loaded]);
 
   const phoneCheck = checkPhone(phone);
   const qtyCheck = checkQty(qty, 20);

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -16,18 +16,28 @@ import { Check, HtzClient } from '../core/api';
 import { checkPhone } from '../core/format';
 import { STORAGE_LABEL } from '../core/storage';
 import { useCreds } from '../ui/credentials';
+import { useDefaults } from '../ui/defaults';
 import { theme } from '../ui/theme';
 
 type Row = { label: string; value: string; ok: boolean; info?: boolean };
 
 export default function SetPhoneScreen() {
   const creds = useCreds();
-  const [phone, setPhone] = useState('0555071161');
+  const { defaults, loaded } = useDefaults();
+  const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [checks, setChecks] = useState<Check[] | null>(null);
   const [done, setDone] = useState(false);
+  const seeded = useRef(false);
+
+  // the stored default is the starting value, but typing wins from then on
+  useEffect(() => {
+    if (!loaded || seeded.current) return;
+    seeded.current = true;
+    setPhone(defaults.phone);
+  }, [loaded]);
 
   const phoneCheck = checkPhone(phone);
   const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && !busy;
@@ -40,13 +50,28 @@ export default function SetPhoneScreen() {
     setDone(false);
     try {
       const client = new HtzClient(creds.email.trim(), creds.password);
-      const rep = await client.applyPhone(phoneCheck.value);
+      const rep = await client.applyPhone(phoneCheck.value, defaults.mode);
 
       const out: Row[] = [
-        { label: 'app phone', value: rep.appPhone || '(none)', ok: rep.appOk },
-        { label: 'web telephone', value: rep.webTelephone || '(none)', ok: rep.webOk },
-        { label: 'מייל נוסף (app)', value: rep.appEmail2 || 'empty', ok: rep.email2Ok },
-        { label: 'web write', value: rep.webWritten ? 'applied' : 'already set', ok: true, info: true },
+        {
+          label: 'app phone',
+          value: rep.appRun ? rep.appPhone || '(none)' : 'skipped (web-only run)',
+          ok: rep.appOk,
+          info: !rep.appRun,
+        },
+        {
+          label: 'web telephone',
+          value: rep.webRun ? rep.webTelephone || '(none)' : 'skipped (app-only run)',
+          ok: rep.webOk,
+          info: !rep.webRun,
+        },
+        {
+          label: 'מייל נוסף (app)',
+          value: rep.appRun ? rep.appEmail2 || 'empty' : 'skipped',
+          ok: rep.email2Ok,
+          info: !rep.appRun,
+        },
+        { label: 'web write', value: rep.webWritten ? 'applied' : rep.webRun ? 'already set' : 'skipped', ok: true, info: true },
       ];
       if (rep.repairs.length) {
         out.push({ label: 'repaired', value: rep.repairs.join(', '), ok: true, info: true });
@@ -87,8 +112,8 @@ export default function SetPhoneScreen() {
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.h1}>Set account phone</Text>
         <Text style={styles.sub}>
-          Writes via the app API (<Text style={styles.code}>cms.htzone.co.il</Text>) — a partial
-          update, so only the phone changes.
+          Writes via the app API (<Text style={styles.code}>cms.htzone.co.il</Text>) and the website.
+          Mode: <Text style={styles.code}>{defaults.mode}</Text> — change it in the Defaults tab.
         </Text>
 
         <Field label="Email" value={creds.email} onChange={creds.setEmail} keyboard="email-address" />

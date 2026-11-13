@@ -23,6 +23,9 @@ export const WEB = 'https://www.htzone.co.il';
 
 export type User = Record<string, any>;
 
+/** Which surfaces a run touches. `both-web` is the default, matching the desktop tool. */
+export type RunMode = 'both-web' | 'both-app' | 'web' | 'app';
+
 export type Check = {
   name: string;
   value: string;
@@ -158,6 +161,8 @@ export class HtzClient {
    * reverse) makes a valid login look like "מייל או סיסמא לא נכונים".
    */
   private jar: Record<string, string> = {};
+  /** when the web session was last established (ms), 0 = unknown */
+  private webAt = 0;
 
   constructor(public email: string, public password: string) {}
 
@@ -248,15 +253,35 @@ export class HtzClient {
   async webLogin(): Promise<void> {
     const loginUrl = `${WEB}/login`;
     const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
-    const page = await this.getText(loginUrl);
-    const m = page.match(/var\s+secure_login\s*=\s*"([^"]+)"/);
-    if (!m) throw new Error('secure_login token not found on /login');
+
+    // The token is per page load and the site drops it when it is throttling
+    // or serving a challenge page — which is exactly what "secure_login token
+    // not found" after a while means. Fetch with a cache-buster and retry with
+    // backoff instead of failing the whole run on the first empty page.
+    let token: string | null = null;
+    let page = '';
+    for (let attempt = 0; attempt < 3 && !token; attempt++) {
+      const url = `${loginUrl}?_=${Date.now()}${attempt ? `&r=${attempt}` : ''}`;
+      page = await this.getText(url);
+      token = HtzClient.tokenFrom(page);
+      if (!token && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 700 * (attempt + 1) ** 2));
+      }
+    }
+    if (!token) {
+      this.webAt = 0;
+      const challenged = /captcha|recaptcha|too many|rate.?limit|\u05d7\u05e1\u05d5\u05dd|\u05d1\u05d5\u05d8/i.test(page) || page.length < 3000;
+      throw new Error(
+        'secure_login token not found on /login (' + page.length + ' B, 3 tries)' +
+          (challenged ? ' — the site is throttling this connection or asking for a challenge; wait a minute and retry' : ''),
+      );
+    }
 
     const form = new URLSearchParams({
       email: this.email,
       password: this.password,
       remember: 'on',
-      secure_login: m[1],
+      secure_login: token,
       file: 'user_service',
       action: 'login',
     });
@@ -281,12 +306,40 @@ export class HtzClient {
     const json = await res.json();
     const webErr = (json?.err ?? '').toString().trim();
     if (webErr) {
+      this.webAt = 0;
       // the site uses one generic message for several causes
       const hint = /לא נכונים/.test(webErr)
         ? ' — the site rejected the credentials: check the password (press Forget and retype it), and note that repeated attempts can be rate-limited'
         : '';
       throw new Error(`web login failed: ${webErr}${hint}`);
     }
+    this.webAt = Date.now();
+  }
+
+  /** The token appears in a few spellings depending on the page variant. */
+  private static tokenFrom(page: string): string | null {
+    const patterns = [
+      /var\s+secure_login\s*=\s*["']([^"']+)["']/,
+      /secure_login\s*[:=]\s*["']([^"']+)["']/,
+      /name=["']secure_login["'][^>]*value=["']([^"']+)["']/,
+      /value=["']([^"']+)["'][^>]*name=["']secure_login["']/,
+    ];
+    for (const re of patterns) {
+      const m = page.match(re);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  /**
+   * Login only when the session is not already known-good.
+   *
+   * Every extra login counts against the site's rate limit and is what turns a
+   * healthy session into "secure_login token not found" later in the day.
+   */
+  async ensureWebSession(force = false): Promise<void> {
+    if (!force && this.webAt && Date.now() - this.webAt < 5 * 60_000) return;
+    await this.webLogin();
   }
 
   /** Both phone-ish inputs in the details form. Re-logs in once if the session lapsed. */
@@ -310,7 +363,7 @@ export class HtzClient {
     let out = await once();
     if (!out.telephone && !out.phone) {
       // page rendered but the form wasn't ours: the session is gone
-      await this.webLogin();
+      await this.ensureWebSession(true);
       out = await once();
     }
     return out;
@@ -357,7 +410,7 @@ export class HtzClient {
     }
 
     try {
-      await this.webLogin();
+      await this.ensureWebSession();
       const form = await this.webForm();
       checks.push({
         name: 'web · /support_page telephone',
@@ -399,7 +452,7 @@ export class HtzClient {
       return await this.readDetailsForm();
     } catch {
       // a lapsed session renders the page without our details block
-      await this.webLogin();
+      await this.ensureWebSession(true);
       return this.readDetailsForm();
     }
   }
@@ -479,7 +532,7 @@ export class HtzClient {
    * vs `telephone`). Writing only one of them is what made the app disagree
    * with the site, so this runs the same guarded sequence the desktop tool does.
    */
-  async applyPhone(phone: string): Promise<{
+  async applyPhone(phone: string, mode: RunMode = 'both-web'): Promise<{
     appPhone: string;
     appOk: boolean;
     appEmail2: string;
@@ -487,54 +540,82 @@ export class HtzClient {
     webTelephone: string;
     webOk: boolean;
     webWritten: boolean;
+    appRun: boolean;
+    webRun: boolean;
     repairs: string[];
     changed: string[];
     serverDerived: string[];
   }> {
-    const before = await this.appLogin();
+    const useApp = mode !== 'web';
+    const useWeb = mode !== 'app';
+    const webFirst = mode !== 'both-app';
 
-    // 1. website first (it replaces the record)
-    await this.webLogin();
-    const webBefore = await this.webForm();
-    const webAlready = canon(webBefore.telephone) === canon(phone);
-    if (!webAlready) await this.webApplyPhone(phone, before);
+    const before: User = useApp ? await this.appLogin() : {};
 
-    // 2. app write, repairing anything the web step disturbed
-    // (when the web write was skipped the record is unchanged — reuse it and
-    //  save a login, because repeated logins are what triggers rate limiting)
-    const mid = webAlready ? before : await this.appLogin();
-    const repairs: Record<string, string> = {};
-    for (const key of REPAIRABLE) {
-      const was = (before as any)[key];
-      const now = (mid as any)[key];
-      if (typeof was === 'string' && was.trim() && was.trim() !== '0') {
-        if (typeof now !== 'string' || !now.trim() || now.trim() === '0') repairs[key] = was;
+    let webBefore: DetailsForm = {};
+    let webAlready = true;
+    let webWritten = false;
+
+    const writeWeb = async () => {
+      await this.ensureWebSession();
+      webBefore = await this.webForm();
+      webAlready = canon(webBefore.telephone) === canon(phone);
+      if (webAlready) return;
+      // passing the app record lets the merge step fill fields the form leaves
+      // empty; without it (web-only run) the form is taken as-is
+      await this.webApplyPhone(phone, useApp ? before : undefined);
+      webWritten = true;
+    };
+
+    let repairs: Record<string, string> = {};
+    const writeApp = async () => {
+      if (!useApp) return;
+      // when the web step rewrote the record, read it back and repair anything
+      // it disturbed; otherwise the first read is still accurate
+      const mid = webFirst && webWritten ? await this.appLogin() : before;
+      repairs = {};
+      for (const key of REPAIRABLE) {
+        const was = (before as any)[key];
+        const now = (mid as any)[key];
+        if (typeof was === 'string' && was.trim() && was.trim() !== '0') {
+          if (typeof now !== 'string' || !now.trim() || now.trim() === '0') repairs[key] = was;
+        }
       }
-    }
-    await this.appSetPhone(phone, repairs);
+      await this.appSetPhone(phone, repairs);
+    };
 
-    // 3. read both back
-    const after = await this.appLogin();
-    const webAfter = await this.webForm();
+    if (useWeb && webFirst) await writeWeb();
+    await writeApp();
+    if (useWeb && !webFirst) await writeWeb();
 
-    const changed = Object.keys({ ...before, ...after }).filter(
-      (k) => !VOLATILE.has(k) && k !== 'phone' && k !== 'email_2' &&
-        JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
-    );
+    // read back whatever was written
+    const after: User = useApp ? await this.appLogin() : {};
+    const webAfter: DetailsForm = useWeb ? await this.webForm() : {};
+
+    const changed = useApp
+      ? Object.keys({ ...before, ...after }).filter(
+          (k) => !VOLATILE.has(k) && k !== 'phone' && k !== 'email_2' &&
+            JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
+        )
+      : [];
     // dynamic server data: reported, never a failure (same split as the desktop tool)
-    const serverDerived = Object.keys({ ...before, ...after }).filter(
-      (k) => VOLATILE.has(k) &&
-        JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
-    );
+    const serverDerived = useApp
+      ? Object.keys({ ...before, ...after }).filter(
+          (k) => VOLATILE.has(k) &&
+            JSON.stringify((before as any)[k]) !== JSON.stringify((after as any)[k]),
+        )
+      : [];
 
     return {
-      appPhone: String(after.phone ?? ''),
-      appOk: canon(after.phone) === canon(phone),
-      appEmail2: String(after.email_2 ?? ''),
-      email2Ok: !String(after.email_2 ?? '').trim(),
-      webTelephone: String(webAfter.telephone ?? ''),
-      webOk: canon(webAfter.telephone) === canon(phone),
-      webWritten: !webAlready,
+      appPhone: useApp ? String(after.phone ?? '') : '',
+      appOk: useApp ? canon(after.phone) === canon(phone) : true,
+      appEmail2: useApp ? String(after.email_2 ?? '') : '',
+      email2Ok: useApp ? !String(after.email_2 ?? '').trim() : true,
+      webTelephone: useWeb ? String(webAfter.telephone ?? '') : '',
+      webOk: useWeb ? canon(webAfter.telephone) === canon(phone) : true,
+      webWritten,
+      appRun: useApp,
+      webRun: useWeb,
       repairs: Object.keys(repairs),
       changed: changed.sort(),
       serverDerived: serverDerived.sort(),

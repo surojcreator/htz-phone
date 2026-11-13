@@ -4,16 +4,19 @@ import { Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react
 
 import HanukkaScreen from './src/screens/HanukkaScreen';
 import SetPhoneScreen from './src/screens/SetPhoneScreen';
+import SettingsScreen from './src/screens/SettingsScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
 import { CredentialsProvider } from './src/ui/credentials';
+import { DefaultsProvider } from './src/ui/defaults';
 import { theme } from './src/ui/theme';
 
-type Tab = 'set' | 'verify' | 'hanukka';
+type Tab = 'set' | 'verify' | 'hanukka' | 'settings';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'set', label: 'Set phone' },
   { id: 'verify', label: 'Verify' },
   { id: 'hanukka', label: 'חנוכה' },
+  { id: 'settings', label: 'Defaults' },
 ];
 
 export default function App() {
@@ -21,7 +24,8 @@ export default function App() {
 
   return (
     <CredentialsProvider>
-      <SafeAreaView style={styles.root}>
+      <DefaultsProvider>
+        <SafeAreaView style={styles.root}>
         <StatusBar style="light" />
         <View style={styles.header}>
           <Text style={styles.title}>Htz Phone</Text>
@@ -56,8 +60,12 @@ export default function App() {
           <View style={[styles.pane, tab !== 'hanukka' && styles.hidden]}>
             <HanukkaScreen />
           </View>
+          <View style={[styles.pane, tab !== 'settings' && styles.hidden]}>
+            <SettingsScreen />
+          </View>
         </View>
       </SafeAreaView>
+      </DefaultsProvider>
     </CredentialsProvider>
   );
 }

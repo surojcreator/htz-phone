@@ -1,14 +1,21 @@
 /**
  * חנוכה order loop — PRO² show tickets (group 156: attractions 166122, 166119).
  *
- * Port of wallet_loop.mjs's attraction path to the app's own HTTP stack:
- *   webLogin -> wallet sign-in (wallet_login_quick) -> item page (variants)
- *   -> cart_service::add_wallet_attraction -> /checkout2_wallet (supplier)
- *   -> checkout2_service::pay_order_wallet
+ * Rewritten for the Next.js store. The legacy XMLHttpRequest layer
+ * (`/_ajax/ajax.index.php`: wallet sign-in, cart_service, checkout2_service) is
+ * gone — it answers 404 now. The new sequence, captured from the site's own
+ * client bundle:
  *
- * The pay body mirrors the request the site itself sends (captured from the
- * checkout page), including `payOption=new_card`, qty on the chosen variant and
- * the order phone.
+ *   POST   /api/auth/login              (HtzClient.webLogin)
+ *   GET    /wallet_attraction_item/<id>?proj_id=<proj>   -> variants JSON
+ *   DELETE /api/cart?kind=quick                          -> empty the cart
+ *   POST   /api/cart/items  {kind, product_id, quantity, variant_id}
+ *   GET    /api/cart?kind=quick                          -> totals
+ *   POST   /api/orders/draft {cart, shipping, new_card}
+ *   POST   /api/orders/payment-session {order_id}        -> card entry URL
+ *
+ * `new_card` is always forced: the order is staged at the card step and never
+ * charged with a stored card.
  */
 import { HtzClient, WEB } from './api';
 
@@ -19,7 +26,13 @@ export const HANUKKA_ITEMS = [
   { id: '166119', label: 'חנוכה 2026 · 166119' },
 ];
 
-export type Variant = { id: number; price: number; desc: string };
+export type Variant = {
+  id: number;
+  price: number;
+  desc: string;
+  fullPrice?: number;
+  max?: number;
+};
 export type Step = { step: string; ok: boolean; detail?: string };
 
 export type HanukkaOptions = {
@@ -28,24 +41,20 @@ export type HanukkaOptions = {
   phone: string;
   collected?: string;      // "252788" or "252787:2,252788:2"
   proj?: string;           // default 156
-  payment?: string;        // default '2' (two payments)
+  payment?: string;        // kept for compatibility; the new API has no option
   payOption?: string;      // forced 'new_card'
   dryRun?: boolean;
-  /** Carry the logged-in session, item page and checkout metadata between orders. */
+  /** Carry the logged-in session and item page between orders. */
   session?: HanukkaSession;
-  /** Ignore the cache and reload the login / item / checkout pages once. */
+  /** Ignore the cache and reload the item page once. */
   forceReload?: boolean;
   shouldStop?: () => boolean;
   log?: (line: string) => void;
 };
 
 /**
- * Per-runner state that survives between orders.
- *
- * Repeating a purchase does not change who is logged in, which project the
- * wallet belongs to, which variants the item has, or who the supplier is — so
- * reloading those pages for every order is pure latency (and extra logins are
- * what the site rate-limits). One runner, one session.
+ * State that survives between orders: identity, variants and the shipping
+ * block do not change per order, so nothing is refetched on a repeat.
  */
 export type HanukkaSession = {
   loggedIn: boolean;
@@ -54,8 +63,6 @@ export type HanukkaSession = {
   variants?: Variant[];
   title?: string;
   allowance?: number;
-  supplier?: string;
-  payment?: string;
 };
 
 export function newHanukkaSession(): HanukkaSession {
@@ -69,6 +76,9 @@ export type HanukkaResult = {
   payload?: string;
   relocation?: string;
   cardUrl?: string;
+  orderId?: number;
+  total?: number;
+  units?: number;
   error?: string;
   raw?: unknown;
 };
@@ -82,48 +92,105 @@ function absoluteUrl(raw: string): string {
 }
 
 /**
- * Classify the pay_order_wallet response.
+ * Classify the payment response.
  *
- * The site answers one of:
- *   { relocation: "…" }                       order finished, follow the redirect
- *   { html: "<iframe src=CreditGuard…>" }      order staged — card entry required
- *   { err: {...} }                             refused
- * The CreditGuard iframe is a SUCCESS for us: the order exists and waits for a card.
+ * New API:  { data: { payment_url } } | { data: { relocation } }
+ * Errors:   { error: { code, message } }
+ * The card URL is a SUCCESS: the order exists and waits for a card.
  */
 export function interpretPayResponse(pay: any): { ok: boolean; relocation?: string; cardUrl?: string; error?: string } {
   if (!pay || typeof pay !== 'object') return { ok: false, error: 'empty response' };
-  const err = pay.err && (pay.err.content || pay.err);
-  if (err) return { ok: false, error: String(err) };
-  if (pay.relocation) return { ok: true, relocation: String(pay.relocation) };
-  const html = typeof pay.html === 'string' ? pay.html : '';
+  const err = pay.error;
+  if (err) return { ok: false, error: [err.code, err.message].filter(Boolean).join(' — ') || 'refused' };
+
+  const d = pay.data ?? pay;
+  if (d.relocation) return { ok: true, relocation: absoluteUrl(String(d.relocation)) };
+  const url = d.payment_url || d.url || d.iframe_url;
+  if (url) return { ok: true, cardUrl: absoluteUrl(String(url)) };
+  const html = typeof d.html === 'string' ? d.html : typeof pay.html === 'string' ? pay.html : '';
   const iframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
   if (iframe) return { ok: true, cardUrl: absoluteUrl(iframe[1]) };
-  if (typeof pay.url === 'string' && pay.url) return { ok: true, cardUrl: absoluteUrl(pay.url) };
+  if (d.id && d.status) return { ok: true };
   return { ok: false, error: 'unrecognised response' };
-}
-
-const enc = (s: string) => encodeURIComponent(s);
-
-/** The site returns err as a string or as { content } — normalise both. */
-function errText(j: any): string {
-  const e = j && j.err;
-  if (!e) return '';
-  if (typeof e === 'string') return e.trim();
-  const s = e.content || e.msg || '';
-  if (s) return String(s).trim();
-  return JSON.stringify(e).slice(0, 160);
 }
 
 function text(s: string): string {
   return s.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/** Rows the item page exposes: data-collected_id / data-price / .cell.desc */
+/**
+ * Rows the item page exposes. The page embeds the product as JSON inside the
+ * Next.js flight payload (`"variants":[{"variantId":…,"price":…}]`), escaped
+ * once. The legacy `data-collected_id` markup is kept as a fallback.
+ */
 export function parseVariants(html: string): Variant[] {
   const out: Variant[] = [];
   const seen = new Set<number>();
-  const chunks = html.split(/(?=data-collected_id=["'])/).slice(1);
-  for (const chunk of chunks) {
+  const flat = html.replace(/\\"/g, '"');
+
+  /** Pull the balanced JSON array that starts after `key`. */
+  const arrayAfter = (key: string): any[] | null => {
+    const at = flat.indexOf(key);
+    if (at < 0) return null;
+    const start = flat.indexOf('[', at + key.length);
+    if (start < 0) return null;
+    let depth = 0;
+    for (let i = start; i < flat.length && i < start + 20000; i++) {
+      const ch = flat[i];
+      if (ch === '[') depth++;
+      else if (ch === ']') {
+        depth--;
+        if (depth === 0) {
+          try {
+            const arr = JSON.parse(flat.slice(start, i + 1));
+            return Array.isArray(arr) ? arr : null;
+          } catch {
+            return null;
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  // The product's own rows: id / desc / price / statusPrice / maxPerOrder.
+  // This is authoritative — `variants` elsewhere on the page can belong to a
+  // recommended item, which is how a ₪169 ticket got shown as ₪58.
+  const options = arrayAfter('"priceOptions":');
+  if (options) {
+    for (const v of options) {
+      const id = Number(v.id ?? v.variantId);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        price: Number(v.statusPrice ?? v.price ?? 0),
+        desc: String(v.desc ?? v.title ?? ''),
+        fullPrice: v.fullPrice != null ? Number(v.fullPrice) : undefined,
+        max: v.maxPerOrder != null ? Number(v.maxPerOrder) : v.available != null ? Number(v.available) : undefined,
+      });
+    }
+    if (out.length) return out;
+  }
+
+  const variants = arrayAfter('"variants":');
+  if (variants) {
+    for (const v of variants) {
+      const id = Number(v.variantId ?? v.id);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        price: Number(v.statusPrice ?? v.price ?? 0),
+        desc: String(v.title ?? v.text ?? ''),
+        fullPrice: v.fullPrice != null ? Number(v.fullPrice) : undefined,
+        max: v.max != null ? Number(v.max) : undefined,
+      });
+    }
+    if (out.length) return out;
+  }
+
+  for (const chunk of html.split(/(?=data-collected_id=["'])/).slice(1)) {
     const m = chunk.match(/^data-collected_id=["'](\d+)["']/);
     if (!m) continue;
     const id = Number(m[1]);
@@ -157,36 +224,24 @@ function buildLines(variants: Variant[], collected: string | undefined, qty: num
   return variants.map((v) => ({ id: v.id, qty: v.id === pick ? qty : 0 }));
 }
 
-/** The checkout2_service::pay_order_wallet body the site posts. */
+/**
+ * Keep-and-print representation of what the order will be, so a dry run still
+ * shows something concrete.
+ */
 export function buildPayBody(o: {
   phone: string;
-  supplier: string;
   item: string;
-  payment: string;
-  payOption: string;
+  name: string;
+  email: string;
   lines: { id: number; qty: number }[];
 }): string {
-  const S = o.supplier;
-  const I = o.item;
-  const parts: string[] = [
-    'shippingPhone2=' + enc(o.phone),
-    'payOption=' + enc(o.payOption),
-    'hdBoxItAddress=',
-    'hdBoxItName=',
-    'hdBoxItLocker=',
-    'chitabox_city_name%5B' + S + '%5D%5B' + I + '%5D=',
-    'preferredPaymentsSelectBox%5B' + S + '%5D=' + enc(o.payment),
-  ];
-  for (const l of o.lines.filter((x) => x.qty > 0)) {
-    parts.push('collected_itemsArr%5Bcollected_id%5D%5B%5D=' + l.id);
-    parts.push('collected_itemsArr%5Bamount%5D%5B%5D=' + l.qty);
-  }
-  parts.push('show_address=1');
-  parts.push('hdSelfDeliveryText=');
-  parts.push('is_quick=1');
-  parts.push('file=checkout2_service');
-  parts.push('action=pay_order_wallet');
-  return parts.join('&');
+  const body = {
+    cart: 'quick',
+    shipping: { name: o.name, phone: o.phone, email: o.email },
+    new_card: true,
+    items: o.lines.filter((l) => l.qty > 0).map((l) => ({ product_id: Number(o.item), variant_id: l.id, quantity: l.qty })),
+  };
+  return JSON.stringify(body, null, 2);
 }
 
 export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promise<HanukkaResult> {
@@ -212,9 +267,6 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
 
   try {
     // ---- session -------------------------------------------------------
-    // An order does not invalidate the login, so repeats reuse it. Reloading
-    // /login for every order costs a round-trip *and* counts against the
-    // site's login rate limit.
     if (sessionReady) {
       add('web login', true, `reused session (${client.email})`);
     } else {
@@ -222,75 +274,33 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       if (sess) sess.loggedIn = true;
       add('web login', true, client.email);
     }
-    if (stopped()) return abort('wallet sign-in');
+    const profile = await client.webProfile();
+    const buyerName = [profile.first_name, profile.last_name].filter(Boolean).join(' ').trim() || '—';
+    const buyerEmail = String(profile.email || client.email);
+    if (stopped()) return abort('item page');
 
-    // ---- wallet sign-in for the item's project -------------------------
-    const signIn = async (p: string): Promise<string | null> => {
-      const after = `after_page=wallet_attraction_item-com&after_id=${item}`;
-      await client.webGet(`/wallet_login/${p}?${after}`);
-      const j = await client.webAjax('special_service', 'wallet_login_quick', {
-        project_id: p,
-        signin_type: '3',
-        after_page: 'wallet_attraction_item-com',
-        after_id: item,
-      }, `/wallet_login/${p}`, 'act');
-      return (j && j.href) || null;
-    };
-
-    const cardUrl = (h: string | null) => {
-      let u = h && /wallet_attraction_item-com\//.test(h) ? h : `/wallet_attraction_item-com/${item}`;
-      if (!/^https?:/i.test(u) && !u.startsWith('/')) u = '/' + u;
-      return u;
-    };
-
-    // Item identity is (project, item): the variants, allowance and supplier
-    // only change when one of those changes.
+    // ---- item page -----------------------------------------------------
     const cacheHit = sessionReady && sess!.proj === proj && sess!.item === item && !!sess!.variants?.length;
-
-    let variants: Variant[] = [];
     let title = '';
-    let allowance = 0;
 
     if (cacheHit) {
       variants = sess!.variants!;
       title = sess!.title || '';
-      allowance = sess!.allowance || 0;
       add('item', true, `${title || item} · ${variants.length} variant(s) · cached`);
     } else {
-      const href = await signIn(proj);
-      if (!href) {
-        add('wallet sign-in', false, 'PRO² quick sign-in refused (account not eligible, or TZ sign-in required)');
-        return { ok: false, steps, variants: [], error: 'wallet sign-in refused' };
-      }
-      add('wallet sign-in', true, `proj ${proj}`);
-
-      let html = await client.webGet(cardUrl(href));
-      const pageProj = (html.match(/proj_id=(\d+)/) || html.match(/wallet_attractions_sale\/(\d+)/) || [])[1];
-      if (pageProj && pageProj !== proj) {
-        const href2 = await signIn(pageProj);
-        if (!href2) {
-          add('wallet sign-in (item project)', false, `proj ${pageProj} refused`);
-          return { ok: false, steps, variants: [], error: 'sign-in refused for the item project' };
-        }
-        proj = pageProj;
-        html = await client.webGet(cardUrl(href2));
-        add('wallet sign-in (item project)', true, `proj ${proj}`);
-      }
-
-      if (!/data-collected_id=["']|class="item_title"/.test(html)) {
-        add('item page', false, `did not render (${html.length} B)`);
-        return { ok: false, steps, variants: [], error: 'item page did not render' };
-      }
+      const html = await client.webGet(`/wallet_attraction_item/${item}?proj_id=${proj}`);
       if (/אין לך זכאות/.test(html)) {
         add('eligibility', false, 'PRO² gate closed — this account has no shop eligibility');
         return { ok: false, steps, variants: [], error: 'no PRO² eligibility on this account' };
       }
-
-      title = text((html.match(/class="item_title"[^>]*>([\s\S]{0,160}?)<\//) || [])[1] || '');
       variants = parseVariants(html);
-      allowance = Number((html.match(/data-max_no_points=['"](\d+)['"]/) || html.match(/data-max=['"](\d+)['"]/) || [])[1] || 0);
+      title = text((html.match(/"title":"([^"]{0,120})"/) || [])[1] || '');
+      if (!variants.length) {
+        add('item page', false, `no variants found (${html.length} B)`);
+        return { ok: false, steps, variants: [], error: 'item page did not expose any variants' };
+      }
+      const allowance = variants.reduce((m, v) => Math.max(m, v.max || 0), 0);
       add('item', true, `${title || item} · ${variants.length} variant(s)${allowance ? ` · allowance ${allowance}` : ''}`);
-
       if (sess) {
         sess.proj = proj;
         sess.item = item;
@@ -306,88 +316,99 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       add('cart selection', false, 'nothing selected');
       return { ok: false, steps, variants, error: 'nothing selected' };
     }
-    const total = wanted.reduce((a, l) => a + l.qty, 0);
-    if (allowance && total > allowance) log(`! ${total} units requested, allowance is ${allowance}`);
     add('cart selection', true, wanted.map((l) => `${l.id}×${l.qty}`).join(', '));
     if (stopped()) return abort('cart add');
 
-    // ---- seed the cart ------------------------------------------------
-    const addToCart = async () => {
-      await client.webAjax("cart_service", "empty_cart", {}, `/wallet_attraction_item/${item}`, "act");
-      return client.webAjax('cart_service', 'add_wallet_attraction', {
-        is_quick: '1',
-        is_collected: variants.length ? '1' : '0',
-        item_id: item,
-        collected_arr: JSON.stringify(wanted.map((l) => ({ collectedId: l.id, quantity: l.qty }))),
-      }, `/wallet_attraction_item/${item}`, 'act');
+    // ---- cart ----------------------------------------------------------
+    const cleared = await client.webApi('DELETE', '/api/cart?kind=quick');
+    if (cleared.status >= 400) {
+      add('cart clear', false, HtzClient.apiError(cleared));
+      return { ok: false, steps, variants, error: HtzClient.apiError(cleared) };
+    }
+
+    let units = 0;
+    for (const l of wanted) {
+      const res = await client.webApi('POST', '/api/cart/items', {
+        kind: 'quick',
+        product_id: Number(item),
+        quantity: l.qty,
+        variant_id: l.id,
+      });
+      if (res.status >= 400 || res.json?.error) {
+        const detail = HtzClient.apiError(res);
+        add('cart add', false, `${l.id}×${l.qty}: ${detail}`);
+        return { ok: false, steps, variants, error: detail };
+      }
+      units += l.qty;
+    }
+
+    const cart = await client.webApi('GET', '/api/cart?kind=quick');
+    const cdata = cart.json?.data || {};
+    const cartLines = (cdata.lines || []) as any[];
+    const total = Number(cdata.total || cdata.checkout?.totalSum || 0);
+    const cartUnits = Number(cdata.checkout?.units ?? cdata.count ?? units);
+    if (!cartLines.length) {
+      add('cart add', false, 'cart is empty after adding (stock / per-member limit)');
+      return { ok: false, steps, variants, error: 'cart stayed empty — per-member limit reached' };
+    }
+    add('cart add', true, `${cartUnits} unit(s) · ₪${total}`);
+
+    const draftBody = {
+      cart: 'quick',
+      shipping: { name: buyerName, phone: opts.phone, email: buyerEmail },
+      new_card: true,
     };
-
-    let addRes = await addToCart();
-    // A reused session can have lapsed while the app sat idle: the site answers
-    // "must be logged in". Re-authenticate and retry the cart once.
-    if (addRes && addRes.status !== 1 && sessionReady && /מחובר|התחבר|login/i.test(errText(addRes))) {
-      log('… session lapsed, logging in again');
-      await client.ensureWebSession(true);
-      await signIn(proj);
-      addRes = await addToCart();
-      add('web login', true, 're-authenticated');
-    }
-    const amount = addRes && addRes.data && Number(addRes.data.amount || 0);
-    if (!addRes || addRes.status !== 1) {
-      const detail = errText(addRes) || `status ${addRes?.status ?? '?'}: ${JSON.stringify(addRes).slice(0, 120)}`;
-      add('cart add', false, detail);
-      return { ok: false, steps, variants, error: detail };
-    }
-    if (amount === 0) {
-      add('cart add', false, 'accepted but added 0 units (stock / per-member limit)');
-      return { ok: false, steps, variants, error: 'silent refusal — 0 units added' };
-    }
-    add('cart add', true, `${amount} unit(s)`);
-
-    // ---- checkout page: supplier + payment options ---------------------
-    // Supplier is a property of the item, not of this order.
-    let supplier = !force && sess?.supplier ? sess.supplier : '';
-    if (supplier) {
-      add('checkout page', true, `supplier ${supplier} · cached`);
-    } else {
-      const co = await client.webGet('/checkout2_wallet');
-      supplier = (co.match(/name="preferredPaymentsSelectBox\[(\d+)\]"/) || [])[1] || '2452';
-      if (sess) sess.supplier = supplier;
-      add('checkout page', true, `supplier ${supplier} · payment 2`);
-    }
-    const payment = opts.payment || sess?.payment || '2';   // two payments — the option the site checks by default
-    if (sess) sess.payment = payment;
-
-    const payBody = buildPayBody({
+    const preview = buildPayBody({
       phone: opts.phone,
-      supplier,
       item,
-      payment,
-      payOption: opts.payOption || 'new_card',
-      lines,
+      name: buyerName,
+      email: buyerEmail,
+      lines: wanted,
     });
 
     if (opts.dryRun) {
-      log('— dry run, payload not sent —');
-      return { ok: true, steps, variants, payload: payBody };
+      log('— dry run: cart filled, order not drafted —');
+      return { ok: true, steps, variants, payload: preview, total, units: cartUnits };
     }
+    if (stopped()) return abort('order draft');
 
-    if (stopped()) return abort('payment');
+    // ---- draft ---------------------------------------------------------
+    const draft = await client.webApi('POST', '/api/orders/draft', draftBody);
+    if (draft.status >= 400 || draft.json?.error) {
+      const detail = HtzClient.apiError(draft);
+      add('order draft', false, detail);
+      return { ok: false, steps, variants, payload: preview, error: detail, raw: draft.json };
+    }
+    const orderId = Number(draft.json?.data?.id || 0);
+    const draftTotal = Number(draft.json?.data?.totals?.total ?? total);
+    add('order draft', true, `order ${orderId} · ₪${draftTotal}${draft.json?.data?.payment?.card_required ? ' · card required' : ''}`);
+    if (stopped()) return abort('payment session');
 
-    const pay = await client.webPostRaw(payBody, '/checkout2_wallet');
-    const verdict = interpretPayResponse(pay);
+    // ---- payment session (card entry) ----------------------------------
+    const pay = await client.webApi('POST', '/api/orders/payment-session', { order_id: orderId });
+    const verdict = interpretPayResponse(pay.json);
     if (!verdict.ok) {
-      const detail = verdict.error || errText(pay) || 'unrecognised response';
-      add('pay', false, detail.slice(0, 160));
-      return { ok: false, steps, variants, payload: payBody, error: detail, raw: pay };
+      const detail = verdict.error || HtzClient.apiError(pay);
+      add('payment', false, detail.slice(0, 160));
+      return { ok: false, steps, variants, payload: preview, orderId, total: draftTotal, error: detail, raw: pay.json };
     }
     if (verdict.relocation) {
-      add('pay', true, `next → ${verdict.relocation}`);
-      return { ok: true, steps, variants, payload: payBody, relocation: verdict.relocation, raw: pay };
+      add('payment', true, `next → ${verdict.relocation}`);
+      return { ok: true, steps, variants, payload: preview, orderId, total: draftTotal, relocation: verdict.relocation, raw: pay.json };
     }
-    add('pay', true, 'order staged — card entry required');
-    log(`CARD PAYMENT REQUIRED -> ${verdict.cardUrl}`);
-    return { ok: true, steps, variants, payload: payBody, cardUrl: verdict.cardUrl, raw: pay };
+    add('payment', true, 'order staged — card entry required');
+    if (verdict.cardUrl) log(`CARD PAYMENT REQUIRED -> ${verdict.cardUrl}`);
+    return {
+      ok: true,
+      steps,
+      variants,
+      payload: preview,
+      orderId,
+      total: draftTotal,
+      units: cartUnits,
+      cardUrl: verdict.cardUrl,
+      raw: pay.json,
+    };
   } catch (e: any) {
     add('error', false, e?.message ?? String(e));
     return { ok: false, steps, variants: [], error: e?.message ?? String(e) };

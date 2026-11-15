@@ -155,6 +155,24 @@ export default function HanukkaScreen() {
     setLines((prev) => [...prev, '· log copied to clipboard']);
   }
 
+  async function clearCart() {
+    if (!creds.email.trim() || !creds.password) {
+      setLines((prev) => [...prev, '· enter the account email/password first']);
+      return;
+    }
+    try {
+      const c = new HtzClient(creds.email.trim(), creds.password);
+      await c.ensureWebSession();
+      const res = await c.webApi('DELETE', '/api/cart?kind=quick');
+      setLines((prev) => [
+        ...prev,
+        res.status < 400 ? '· cart cleared' : '· could not clear the cart: ' + HtzClient.apiError(res),
+      ]);
+    } catch (e: any) {
+      setLines((prev) => [...prev, '· could not clear the cart: ' + (e?.message ?? String(e))]);
+    }
+  }
+
   const canRun = !!creds.email.trim() && !!creds.password && phoneCheck.ok && qtyCheck.ok && !busy;
 
   function confirmAndRun() {
@@ -330,6 +348,13 @@ export default function HanukkaScreen() {
                 : 'failed'}
             </Text>
             {result.relocation && <Text style={styles.mono}>next → {result.relocation}</Text>}
+            {!!result.orderId && (
+              <Text style={styles.mono}>
+                order {result.orderId}
+                {typeof result.total === 'number' ? ` · ₪${result.total}` : ''}
+                {typeof result.units === 'number' ? ` · ${result.units} unit(s)` : ''}
+              </Text>
+            )}
             {result.error && <Text style={[styles.mono, { color: theme.bad }]}>{result.error}</Text>}
             {result.cardUrl && (
               <>
@@ -344,6 +369,19 @@ export default function HanukkaScreen() {
                 </Pressable>
               </>
             )}
+          </View>
+        )}
+
+        {!!result?.variants?.length && (
+          <View style={styles.card}>
+            <Text style={[styles.cardTitle, { color: theme.text }]}>Variants on the page</Text>
+            {result.variants.map((v) => (
+              <Text key={v.id} style={styles.mono} selectable>
+                {v.id} · ₪{v.price}
+                {v.fullPrice && v.fullPrice !== v.price ? ` (was ₪${v.fullPrice})` : ''}
+                {v.max ? ` · max ${v.max}` : ''} — {v.desc}
+              </Text>
+            ))}
           </View>
         )}
 
@@ -367,6 +405,13 @@ export default function HanukkaScreen() {
                 style={({ pressed }) => [styles.shareButton, pressed && { opacity: 0.85 }]}
               >
                 <Text style={styles.shareText}>Save as defaults</Text>
+              </Pressable>
+              <Pressable
+                onPress={clearCart}
+                disabled={busy}
+                style={({ pressed }) => [styles.shareButton, busy && { opacity: 0.4 }, pressed && { opacity: 0.85 }]}
+              >
+                <Text style={styles.shareText}>Clear cart</Text>
               </Pressable>
             </View>
             {lines.map((l, i) => (

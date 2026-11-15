@@ -562,6 +562,69 @@ export class HtzClient {
   }
 
   /**
+   * JSON call against the site's API with the stored session.
+   *
+   * Retries once on 429 (the site rate-limits aggressively) and twice on 5xx,
+   * honouring `Retry-After` when present.
+   */
+  async webApi(
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    path: string,
+    body?: unknown,
+  ): Promise<{ status: number; json: any }> {
+    const url = path.startsWith('http') ? path : WEB + path;
+    let attempt = 0;
+    let last: { status: number; json: any } = { status: 0, json: {} };
+
+    while (attempt < 3) {
+      const res = await withTimeout(
+        fetch(url, {
+          method,
+          headers: {
+            Accept: 'application/json',
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+            Referer: `${WEB}/`,
+            ...(this.cookieHeaderFor(url) ? { Cookie: this.cookieHeaderFor(url)! } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          credentials: 'omit',
+        }),
+        30000,
+      );
+      this.absorb(res, url);
+      const text = await res.text();
+      let json: any = {};
+      try {
+        json = text ? JSON.parse(text) : {};
+      } catch {
+        json = { raw: text.slice(0, 300) };
+      }
+      last = { status: res.status, json };
+
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt === 2) break;
+
+      const after = Number(res.headers.get('retry-after') || 0);
+      const wait = after > 0 ? after * 1000 : 1500 * (attempt + 1) ** 2;
+      await new Promise((r) => setTimeout(r, Math.min(wait, 20000)));
+      attempt++;
+    }
+    return last;
+  }
+
+  /** Message from an API error body, falling back to the status code. */
+  static apiError(res: { status: number; json: any }): string {
+    const e = res?.json?.error;
+    const bits: string[] = [];
+    if (e?.code) bits.push(String(e.code));
+    if (e?.message) bits.push(String(e.message));
+    const details = e?.details ? Object.keys(e.details) : [];
+    if (details.length) bits.push('fields: ' + details.join(', '));
+    if (!bits.length) bits.push(res?.json?.raw ? String(res.json.raw).slice(0, 120) : `status ${res?.status}`);
+    return bits.join(' — ');
+  }
+
+  /**
    * Set the phone on the website.
    *
    * `POST /api/profile/update` takes the whole profile as JSON (the legacy form

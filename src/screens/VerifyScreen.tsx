@@ -64,7 +64,7 @@ export default function VerifyScreen() {
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.h1}>Verify phone</Text>
         <Text style={styles.sub}>
-          Read-only. Two independent app-API sessions plus the web profile, and a hunt for any
+          Read-only. Two independent app-API sessions plus the website profile, and a hunt for any
           stale number.
         </Text>
 

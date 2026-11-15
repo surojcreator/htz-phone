@@ -7,7 +7,7 @@
  * Dry run prints the pay_order_wallet body and never pays.
  */
 import { HtzClient } from '../src/core/api';
-import { buildPayBody, newHanukkaSession, parseVariants, runHanukka } from '../src/core/hanukka';
+import { parseVariants, runHanukka, newHanukkaSession } from '../src/core/hanukka';
 
 function arg(name: string, fallback = ''): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -54,9 +54,10 @@ function arg(name: string, fallback = ''): string {
     for (const v of res.variants) console.log(`    ${v.id}  ₪${v.price}  ${v.desc}`);
   }
   if (res.payload) {
-    console.log('\n  pay_order_wallet body:');
-    console.log(res.payload.split('&').map((p) => '    ' + p).join('\n'));
+    console.log('\n  order payload:');
+    console.log(res.payload.split('\n').map((p) => '    ' + p).join('\n'));
   }
+  if (res.orderId) console.log('\n  order id:', res.orderId, ' total: ₪' + res.total);
   if (res.raw) {
     console.log('\n  raw response:');
     console.log('   ' + JSON.stringify(res.raw).slice(0, 1200));

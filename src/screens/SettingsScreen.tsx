@@ -22,6 +22,7 @@ export default function SettingsScreen() {
   const [delay, setDelay] = useState(String(defaults.delay));
   const [dryRun, setDryRun] = useState(defaults.dryRun);
   const [background, setBackground] = useState(defaults.background);
+  const [freshLogin, setFreshLogin] = useState(defaults.freshLogin);
   const [mode, setMode] = useState(defaults.mode);
   const [touched, setTouched] = useState(false);
   const [notice, setNotice] = useState('');
@@ -38,6 +39,7 @@ export default function SettingsScreen() {
     setDelay(String(defaults.delay));
     setDryRun(defaults.dryRun);
     setBackground(defaults.background);
+    setFreshLogin(defaults.freshLogin);
     setMode(defaults.mode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
@@ -67,6 +69,7 @@ export default function SettingsScreen() {
       delay: delayNum,
       dryRun,
       background,
+      freshLogin,
       mode,
     });
     setTouched(false);
@@ -86,6 +89,7 @@ export default function SettingsScreen() {
     setDelay(String(BUILT_IN.delay));
     setDryRun(BUILT_IN.dryRun);
     setBackground(BUILT_IN.background);
+    setFreshLogin(BUILT_IN.freshLogin);
     setMode(BUILT_IN.mode);
   }
 
@@ -186,6 +190,16 @@ export default function SettingsScreen() {
           thumbColor="#fff"
         />
       </View>
+      <View style={styles.switchRow}>
+        <Text style={[styles.label, { flex: 1 }]}>Log in fresh before each batch</Text>
+        <Switch
+          value={freshLogin}
+          onValueChange={(v) => { mark(); setFreshLogin(v); }}
+          trackColor={{ true: theme.accent, false: theme.border }}
+          thumbColor="#fff"
+        />
+      </View>
+
       <View style={styles.switchRow}>
         <Text style={styles.label}>Keep running in the background</Text>
         <Switch

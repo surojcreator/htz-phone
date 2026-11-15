@@ -38,6 +38,7 @@ export default function HanukkaScreen() {
   const [dryRun, setDryRun] = useState(true);
   const [reload, setReload] = useState(false);
   const [background, setBackground] = useState(true);
+  const [freshLogin, setFreshLogin] = useState(true);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
   const [continueOnError, setContinueOnError] = useState(false);
@@ -58,6 +59,7 @@ export default function HanukkaScreen() {
     setDelay(String(defaults.delay));
     setDryRun(defaults.dryRun);
     setBackground(defaults.background);
+    setFreshLogin(defaults.freshLogin);
   }, [loaded]);
 
   const phoneCheck = checkPhone(phone);
@@ -104,6 +106,7 @@ export default function HanukkaScreen() {
           collected: variant.trim() || undefined,
           dryRun,
           session,
+          freshLogin,
           forceReload: reload && i > 1,
           shouldStop: () => cancelRef.current,
           log: push,
@@ -146,6 +149,7 @@ export default function HanukkaScreen() {
       delay: checkInt(delay, 1200, 0),
       dryRun,
       background,
+      freshLogin,
     });
     setLines((prev) => [...prev, '· current values saved as defaults']);
   }
@@ -276,6 +280,19 @@ export default function HanukkaScreen() {
         </View>
         <Text style={styles.hint}>
           Off: one login and one item-page load for the whole batch — repeats go straight to cart + pay.
+        </Text>
+
+        <View style={styles.switchRow}>
+          <Text style={[styles.label, { flex: 1 }]}>Log in fresh before the batch</Text>
+          <Switch
+            value={freshLogin}
+            onValueChange={setFreshLogin}
+            trackColor={{ true: theme.accent, false: theme.border }}
+            thumbColor="#fff"
+          />
+        </View>
+        <Text style={styles.hint}>
+          On: a clean login before the first order (repeats still reuse it). Off: reuse whatever session is already open.
         </Text>
 
         <View style={styles.switchRow}>

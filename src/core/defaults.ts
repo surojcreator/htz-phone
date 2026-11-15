@@ -24,6 +24,8 @@ export type Defaults = {
   delay: number;
   dryRun: boolean;
   background: boolean;
+  /** log in from scratch before the first order of a batch */
+  freshLogin: boolean;
   /** which surfaces a set-phone run touches */
   mode: RunMode;
 };
@@ -38,6 +40,7 @@ export const BUILT_IN: Defaults = {
   delay: 1200,
   dryRun: true,
   background: true,
+  freshLogin: true,
   mode: 'both-web',
 };
 
@@ -72,6 +75,7 @@ export function normalize(raw: any): Defaults {
     delay: clampInt(r.delay, BUILT_IN.delay, 0, 600000),
     dryRun: typeof r.dryRun === 'boolean' ? r.dryRun : BUILT_IN.dryRun,
     background: typeof r.background === 'boolean' ? r.background : BUILT_IN.background,
+    freshLogin: typeof r.freshLogin === 'boolean' ? r.freshLogin : BUILT_IN.freshLogin,
     mode: MODES.includes(r.mode) ? (r.mode as RunMode) : BUILT_IN.mode,
   };
 }

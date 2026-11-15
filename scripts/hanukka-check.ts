@@ -31,6 +31,7 @@ function arg(name: string, fallback = ''): string {
     phone: arg('phone', '0555073599'),
     collected: arg('collect', undefined as unknown as string) || undefined,
     dryRun: process.argv.includes('--dry-run'),
+    freshLogin: !process.argv.includes('--no-fresh-login'),
     session,
     log: (l) => console.log('  ' + l),
   });
@@ -44,6 +45,7 @@ function arg(name: string, fallback = ''): string {
       phone: arg('phone', '0555073599'),
       collected: arg('collect', undefined as unknown as string) || undefined,
       dryRun: process.argv.includes('--dry-run'),
+      freshLogin: false,
       session,
       log: (l) => console.log('  ' + l),
     });

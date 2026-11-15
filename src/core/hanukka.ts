@@ -46,6 +46,8 @@ export type HanukkaOptions = {
   dryRun?: boolean;
   /** Carry the logged-in session and item page between orders. */
   session?: HanukkaSession;
+  /** Force a fresh login before the first order of the batch (default true). */
+  freshLogin?: boolean;
   /** Ignore the cache and reload the item page once. */
   forceReload?: boolean;
   shouldStop?: () => boolean;
@@ -267,12 +269,19 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
 
   try {
     // ---- session -------------------------------------------------------
+    // The first order of a batch logs in from scratch; repeats reuse it. A
+    // fresh login is what guarantees the account is really authenticated
+    // before an order is drafted, even if the app has been idle for hours.
     if (sessionReady) {
       add('web login', true, `reused session (${client.email})`);
-    } else {
+    } else if (opts.freshLogin === false) {
       await client.ensureWebSession();
       if (sess) sess.loggedIn = true;
       add('web login', true, client.email);
+    } else {
+      await client.webLogin();
+      if (sess) sess.loggedIn = true;
+      add('web login', true, `fresh login (${client.email})`);
     }
     const profile = await client.webProfile();
     const buyerName = [profile.first_name, profile.last_name].filter(Boolean).join(' ').trim() || '—';

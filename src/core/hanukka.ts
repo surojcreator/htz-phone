@@ -48,6 +48,8 @@ export type HanukkaOptions = {
   session?: HanukkaSession;
   /** Force a fresh login before the first order of the batch (default true). */
   freshLogin?: boolean;
+  /** Force a login even if reuse is enabled — used for the every-N-orders refresh. */
+  forceSessionRefresh?: boolean;
   /** How many times a 429 may be absorbed by rebuilding the cart (default 2). */
   retryOnRateLimit?: number;
   /** Ignore the cache and reload the item page once. */
@@ -276,6 +278,10 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     // before an order is drafted, even if the app has been idle for hours.
     if (sessionReady) {
       add('web login', true, `reused session (${client.email})`);
+    } else if (opts.forceSessionRefresh) {
+      await client.webLogin();
+      if (sess) sess.loggedIn = true;
+      add('web login', true, `refreshed session (${client.email})`);
     } else if (opts.freshLogin === false) {
       await client.ensureWebSession();
       if (sess) sess.loggedIn = true;
@@ -424,6 +430,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     let orderId = 0;
     let draftTotal = total;
     let payRaw: any = null;
+    let adopted = false;
     let verdict: { ok: boolean; relocation?: string; cardUrl?: string; error?: string } = { ok: false };
     let gaveUp = false;
 
@@ -449,14 +456,27 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       }
 
       if (draft.status >= 400 || draft.json?.error) {
-        const detail = HtzClient.apiError(draft);
-        add('order draft', false, detail);
-        return { ok: false, steps, variants, payload: preview, error: detail, raw: draft.json };
-      }
+        const code = draft.json?.error?.code;
+        const existing = Number(draft.json?.error?.details?.order_id || 0);
 
-      orderId = Number(draft.json?.data?.id || 0);
-      draftTotal = Number(draft.json?.data?.totals?.total ?? total);
-      add('order draft', true, `order ${orderId} · ₪${draftTotal}${draft.json?.data?.payment?.card_required ? ' · card required' : ''}`);
+        // A previous run left a checkout open on this cart. Nothing is wrong
+        // with the request — the store just refuses a second draft. Adopt the
+        // order that already exists and take it to payment instead of dying
+        // with "cart_checkout_in_progress".
+        if (code === 'cart_checkout_in_progress' && existing) {
+          orderId = existing;
+          adopted = true;
+          add('order draft', true, `resuming unfinished checkout ${orderId}`);
+        } else {
+          const detail = HtzClient.apiError(draft);
+          add('order draft', false, detail);
+          return { ok: false, steps, variants, payload: preview, error: detail, raw: draft.json };
+        }
+      } else {
+        orderId = Number(draft.json?.data?.id || 0);
+        draftTotal = Number(draft.json?.data?.totals?.total ?? total);
+        add('order draft', true, `order ${orderId} · ₪${draftTotal}${draft.json?.data?.payment?.card_required ? ' · card required' : ''}`);
+      }
       if (stopped()) return abort('payment session');
 
       let pay = await client.webApi('POST', '/api/orders/payment-session', { order_id: orderId });

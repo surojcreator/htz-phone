@@ -11,7 +11,7 @@ type Reply = { status: number; json: any };
 const ok = (json: any): Reply => ({ status: 200, json });
 const rl: Reply = { status: 429, json: { error: { code: 'too_many_requests', message: 'יותר מדי ניסיונות' } } };
 
-function makeClient(plan: { draft429: number; pay429: number }) {
+function makeClient(plan: { draft429: number; pay429: number; draft409Order?: number }) {
   const counts = { delete: 0, add: 0, draft: 0, pay: 0, get: 0 };
   let draftLeft = plan.draft429;
   let payLeft = plan.pay429;
@@ -38,6 +38,18 @@ function makeClient(plan: { draft429: number; pay429: number }) {
       }
       if (path === '/api/orders/draft') {
         counts.draft++;
+        if (plan.draft409Order && counts.draft === 1) {
+          return {
+            status: 409,
+            json: {
+              error: {
+                code: 'cart_checkout_in_progress',
+                message: 'תהליך תשלום כבר מתבצע עבור סל זה.',
+                details: { code_number: 4207, order_id: plan.draft409Order },
+              },
+            },
+          };
+        }
         if (draftLeft > 0) {
           draftLeft--;
           return rl;
@@ -58,7 +70,7 @@ function makeClient(plan: { draft429: number; pay429: number }) {
   return { client, counts };
 }
 
-async function scenario(name: string, plan: { draft429: number; pay429: number }, expect: (c: any) => string | null) {
+async function scenario(name: string, plan: { draft429: number; pay429: number; draft409Order?: number }, expect: (c: any, res: any) => string | null) {
   const { client, counts } = makeClient(plan);
   const res = await runHanukka(client, {
     itemId: '166122',
@@ -69,7 +81,7 @@ async function scenario(name: string, plan: { draft429: number; pay429: number }
     retryOnRateLimit: 2,
     log: () => {},
   });
-  const problem = expect(counts);
+  const problem = expect(counts, res);
   console.log(`\n${name}`);
   console.log('  result:', res.ok ? 'ok' : 'FAILED', res.orderId ? `order ${res.orderId}` : '', res.error || '');
   console.log('  calls :', JSON.stringify(counts));
@@ -97,5 +109,11 @@ async function scenario(name: string, plan: { draft429: number; pay429: number }
     c.pay === 3 && c.draft === 2 && c.delete === 2 && c.add === 2
       ? null
       : 'expected one plain retry, then a rebuild + new draft',
+  );
+
+  await scenario('draft 409 checkout-in-progress -> adopt existing order', { draft429: 0, pay429: 0, draft409Order: 5555 }, (c, res) =>
+    c.draft === 1 && c.pay === 1 && res.orderId === 5555
+      ? null
+      : `expected to resume order 5555 without redrafting (got ${res.orderId})`,
   );
 })();

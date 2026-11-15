@@ -25,6 +25,7 @@ function arg(name: string, fallback = ''): string {
   const client = new HtzClient(email, password);
   const session = newHanukkaSession();
   const reps = Math.max(1, parseInt(arg('reps', '1'), 10) || 1);
+  const every = Math.max(0, parseInt(arg('session-every', '5'), 10) || 0);
   let res = await runHanukka(client, {
     itemId: arg('item', '166122'),
     qty: parseInt(arg('qty', '4'), 10) || 4,
@@ -36,9 +37,14 @@ function arg(name: string, fallback = ''): string {
     log: (l) => console.log('  ' + l),
   });
 
-  // repeats reuse the session — the second pass must not log in again
+  // repeats reuse the session — a fresh one every N orders, like the app does
   for (let i = 2; i <= reps && res.ok; i++) {
     console.log(`\n  === repeat ${i}/${reps} ===`);
+    const refreshing = every > 0 && (i - 1) % every === 0;
+    if (refreshing) {
+      session.loggedIn = false;
+      console.log(`  · refreshing session for order ${i}`);
+    }
     res = await runHanukka(client, {
       itemId: arg('item', '166122'),
       qty: parseInt(arg('qty', '4'), 10) || 4,
@@ -46,6 +52,7 @@ function arg(name: string, fallback = ''): string {
       collected: arg('collect', undefined as unknown as string) || undefined,
       dryRun: process.argv.includes('--dry-run'),
       freshLogin: false,
+      forceSessionRefresh: refreshing,
       session,
       log: (l) => console.log('  ' + l),
     });

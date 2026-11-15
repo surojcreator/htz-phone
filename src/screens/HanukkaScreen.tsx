@@ -98,6 +98,17 @@ export default function HanukkaScreen() {
         }
         const eta = done > 0 ? Math.round(((Date.now() - started) / done) * (total - done) / 1000) : 0;
         setProgress(`${i}/${total}` + (done > 0 ? ` · ${failed} failed · ~${eta}s left` : ''));
+
+        // A long batch outlives its session: the store expires it or starts
+        // refusing writes. Open a brand-new one every N orders instead of
+        // discovering it halfway through an order.
+        const refreshEvery = defaults.sessionRefreshEvery;
+        const refreshing = i > 1 && refreshEvery > 0 && (i - 1) % refreshEvery === 0;
+        if (refreshing) {
+          session.loggedIn = false;
+          push(`· refreshing session for order ${i}`);
+        }
+
         push(`— run ${i}/${total} —`);
         const res = await runHanukka(client, {
           itemId,
@@ -107,13 +118,14 @@ export default function HanukkaScreen() {
           dryRun,
           session,
           freshLogin,
+          forceSessionRefresh: refreshing,
           retryOnRateLimit: defaults.rateLimitRetries,
           forceReload: reload && i > 1,
           shouldStop: () => cancelRef.current,
           log: push,
         });
         setResult(res);
-        if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('&')]);
+        if (res.payload) setLines((prev) => [...prev, '', ...res.payload!.split('\n')]);
         done++;
         if (!res.ok) {
           failed++;
@@ -158,6 +170,29 @@ export default function HanukkaScreen() {
   async function copyLog() {
     await Clipboard.setStringAsync(report).catch(() => {});
     setLines((prev) => [...prev, '· log copied to clipboard']);
+  }
+
+  /**
+   * PPS links carry a transaction id that goes stale; asking again for the same
+   * order returns a fresh one without creating a second order.
+   */
+  async function refreshPaymentLink() {
+    const orderId = result?.orderId;
+    if (!orderId || !creds.email.trim()) return;
+    try {
+      const c = new HtzClient(creds.email.trim(), creds.password);
+      await c.ensureWebSession();
+      const res = await c.webApi('POST', '/api/orders/payment-session', { order_id: orderId });
+      const url = res.json?.data?.payment_url;
+      if (res.status < 400 && url) {
+        setResult((prev) => (prev ? { ...prev, cardUrl: String(url) } : prev));
+        setLines((prev) => [...prev, `· new payment link for order ${orderId}`]);
+      } else {
+        setLines((prev) => [...prev, '· could not refresh the link: ' + HtzClient.apiError(res)]);
+      }
+    } catch (e: any) {
+      setLines((prev) => [...prev, '· could not refresh the link: ' + (e?.message ?? String(e))]);
+    }
   }
 
   async function clearCart() {
@@ -385,6 +420,12 @@ export default function HanukkaScreen() {
                 >
                   <Text style={styles.cardButtonText}>Open card page</Text>
                 </Pressable>
+                <Pressable
+                  onPress={refreshPaymentLink}
+                  style={({ pressed }) => [styles.linkButton, pressed && { opacity: 0.85 }]}
+                >
+                  <Text style={styles.linkButtonText}>New payment link (if it expired)</Text>
+                </Pressable>
               </>
             )}
           </View>
@@ -522,5 +563,7 @@ const styles = StyleSheet.create({
   },
   logActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   shareText: { color: theme.dim, fontSize: 11.5, fontWeight: '700' },
+  linkButton: { alignSelf: 'flex-start', marginTop: 10, paddingVertical: 4 },
+  linkButtonText: { color: theme.accent, fontSize: 12, fontWeight: '700' },
   mono: { color: theme.dim, fontSize: 11.5, lineHeight: 17 },
 });

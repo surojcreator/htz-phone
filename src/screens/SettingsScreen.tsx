@@ -24,6 +24,7 @@ export default function SettingsScreen() {
   const [background, setBackground] = useState(defaults.background);
   const [freshLogin, setFreshLogin] = useState(defaults.freshLogin);
   const [rlRetries, setRlRetries] = useState(String(defaults.rateLimitRetries));
+  const [sessionEvery, setSessionEvery] = useState(String(defaults.sessionRefreshEvery));
   const [mode, setMode] = useState(defaults.mode);
   const [touched, setTouched] = useState(false);
   const [notice, setNotice] = useState('');
@@ -42,6 +43,7 @@ export default function SettingsScreen() {
     setBackground(defaults.background);
     setFreshLogin(defaults.freshLogin);
     setRlRetries(String(defaults.rateLimitRetries));
+    setSessionEvery(String(defaults.sessionRefreshEvery));
     setMode(defaults.mode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
@@ -56,7 +58,9 @@ export default function SettingsScreen() {
   const itemOk = /^\d{3,}$/.test(itemId.trim());
   const rlNum = parseInt(rlRetries, 10);
   const rlOk = Number.isFinite(rlNum) && rlNum >= 0 && rlNum <= 5;
-  const canSave = phoneCheck.ok && orderCheck.ok && qtyCheck.ok && repeatsOk && delayOk && itemOk && rlOk;
+  const seNum = parseInt(sessionEvery, 10);
+  const seOk = Number.isFinite(seNum) && seNum >= 0 && seNum <= 50;
+  const canSave = phoneCheck.ok && orderCheck.ok && qtyCheck.ok && repeatsOk && delayOk && itemOk && rlOk && seOk;
 
   async function save() {
     if (!canSave) {
@@ -75,6 +79,7 @@ export default function SettingsScreen() {
       background,
       freshLogin,
       rateLimitRetries: rlNum,
+      sessionRefreshEvery: seNum,
       mode,
     });
     setTouched(false);
@@ -96,6 +101,7 @@ export default function SettingsScreen() {
     setBackground(BUILT_IN.background);
     setFreshLogin(BUILT_IN.freshLogin);
     setRlRetries(String(BUILT_IN.rateLimitRetries));
+    setSessionEvery(String(BUILT_IN.sessionRefreshEvery));
     setMode(BUILT_IN.mode);
   }
 
@@ -180,6 +186,14 @@ export default function SettingsScreen() {
         keyboard="number-pad"
         placeholder={String(BUILT_IN.rateLimitRetries)}
         error={rlRetries.length > 0 && !rlOk ? '0 to 5' : undefined}
+      />
+      <Field
+        label="New session every N orders (0 = never)"
+        value={sessionEvery}
+        onChange={(v) => { mark(); setSessionEvery(v); }}
+        keyboard="number-pad"
+        placeholder={String(BUILT_IN.sessionRefreshEvery)}
+        error={sessionEvery.length > 0 && !seOk ? '0 to 50' : undefined}
       />
 
       <Text style={[styles.label, { marginTop: 18 }]}>Set phone run mode</Text>

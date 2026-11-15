@@ -171,6 +171,10 @@ export class HtzClient {
   /** Shared per account so a fresh screen doesn't log in again. */
   private static sessions = new Map<string, { jar: Record<string, string>; webAt: number }>();
 
+  /** last profile read from the site (login or update response) */
+  private webUser: any = null;
+  private webUserAt = 0;
+
   private get sess() {
     const key = this.email.trim().toLowerCase();
     let s = HtzClient.sessions.get(key);
@@ -290,16 +294,67 @@ export class HtzClient {
     throw lastErr;
   }
 
-  /** Web login: needs the inline secure_login token from /login. */
+  /**
+   * Web login.
+   *
+   * The site was migrated to a Next.js app: `POST /api/auth/login` returns the
+   * user as JSON and sets `__Host-htz_session`. The old server-rendered page and
+   * its `secure_login` + `/_ajax/ajax.index.php` endpoints are gone (404), so the
+   * legacy path stays only as a fallback in case the old site is ever served
+   * again.
+   */
   async webLogin(): Promise<void> {
+    try {
+      await this.webLoginApi();
+      return;
+    } catch (e: any) {
+      // 404 / not_found means the legacy stack is what is live
+      const legacy = /not_found|404|non-JSON/i.test(e?.message ?? '');
+      if (!legacy) throw e;
+    }
+    await this.webLoginLegacy();
+  }
+
+  /** Next.js stack. */
+  private async webLoginApi(): Promise<void> {
+    const url = `${WEB}/api/auth/login`;
+    const res = await withTimeout(
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...(this.cookieHeaderFor(url) ? { Cookie: this.cookieHeaderFor(url)! } : {}),
+        },
+        body: JSON.stringify({ email: this.email, password: this.password }),
+        credentials: 'omit',
+      }),
+      25000,
+    );
+    this.absorb(res, url);
+    const text = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`non-JSON response (${res.status}): ${text.slice(0, 120)}`);
+    }
+    const errCode = json?.error?.code || json?.error?.message;
+    if (!res.ok || errCode || !json?.data) {
+      throw new Error(String(errCode || `login failed (${res.status})`));
+    }
+    this.webUser = json.data;
+    this.webUserAt = Date.now();
+    this.sess.webAt = Date.now();
+  }
+
+  /** The pre-migration stack: /login token + /_ajax/ajax.index.php. */
+  private async webLoginLegacy(): Promise<void> {
     const ajaxUrl = `${WEB}/_ajax/ajax.index.php`;
     let lastPage = '';
     let lastErr = '';
 
     for (let attempt = 0; attempt < 4; attempt++) {
-      // A fresh session id on the first two attempts: it is the only reliable
-      // way to escape a session the site has decided to stop issuing tokens for
-      // (previously a reinstall was the workaround — this is the same thing).
       if (attempt < 2) this.mintWebSession();
 
       const loginUrl = `${WEB}/login?_=${Date.now()}&a=${attempt}`;
@@ -353,8 +408,6 @@ export class HtzClient {
       }
 
       lastErr = webErr;
-      // "wrong password" is also what a token/session mismatch looks like, so
-      // one retry with a brand-new session is worth it; after that it is real.
       if (!/לא נכונים/.test(webErr) || attempt >= 1) break;
       await new Promise((r) => setTimeout(r, 800));
     }
@@ -364,8 +417,8 @@ export class HtzClient {
       /captcha|recaptcha|too many|rate.?limit|\u05d7\u05e1\u05d5\u05dd|\u05d1\u05d5\u05d8/i.test(lastPage) ||
       (!!lastPage && lastPage.length < 3000);
     const why = /לא נכונים/.test(lastErr)
-      ? `web login failed: ${lastErr} — the site rejected the credentials (or this session). Press Reset session in Defaults and try again; if it repeats, check the password.`
-      : `secure_login token not found on /login (${lastPage.length} B, 4 tries)` +
+      ? `web login failed: ${lastErr} — the site rejected the credentials. Press Reset session in Defaults and try again; if it repeats, check the password.`
+      : `login page unsupported (${lastPage.length} B, 4 tries)` +
         (challenged
           ? ' — the site is throttling this connection or asking for a challenge; wait a minute and retry'
           : ` — last error: ${lastErr || 'none'}`);
@@ -398,31 +451,10 @@ export class HtzClient {
     await this.webLogin();
   }
 
-  /** Both phone-ish inputs in the details form. Re-logs in once if the session lapsed. */
+  /** Both phone-ish inputs of the web profile. */
   async webReadPhones(): Promise<{ telephone: string; phone: string; html: string }> {
-    const once = async () => {
-      const pageUrl = `${WEB}/support_page`;
-      const html = await this.getText(pageUrl);
-      // The details form lives inside a JSON-escaped HTML string. Unescape the
-      // quotes once, then match conventionally — and anchor `value=` so
-      // `data-value=` can never win the match.
-      const flat = html.replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-      const read = (field: string) => {
-        const tag = flat.match(new RegExp(`<input[^>]*\\bname=['"]${field}['"][^>]*>`));
-        if (!tag) return '';
-        const v = tag[0].match(/(?:^|\s)value\s*=\s*['"]([^'"]*)/);
-        return v ? v[1] : '';
-      };
-      return { telephone: read('telephone'), phone: read('phone'), html };
-    };
-
-    let out = await once();
-    if (!out.telephone && !out.phone) {
-      // page rendered but the form wasn't ours: the session is gone
-      await this.ensureWebSession(true);
-      out = await once();
-    }
-    return out;
+    const form = await this.webForm();
+    return { telephone: form.telephone ?? '', phone: form.phone ?? '', html: '' };
   }
 
   /**
@@ -466,10 +498,11 @@ export class HtzClient {
     }
 
     try {
-      await this.ensureWebSession();
+      // a verify must read the live record, never a cached one
+      await this.webLogin();
       const form = await this.webForm();
       checks.push({
-        name: 'web · /support_page telephone',
+        name: 'web · profile telephone',
         value: String(form.telephone ?? ''),
         ok: canon(form.telephone) === expect,
       });
@@ -477,7 +510,7 @@ export class HtzClient {
         if (key === 'telephone' || !PHONE_KEY.test(key)) continue;
         if (!digits(value)) continue;
         checks.push({
-          name: `web · /support_page ${key}`,
+          name: `web · profile ${key}`,
           value,
           ok: canon(value) === expect,
         });
@@ -485,13 +518,13 @@ export class HtzClient {
       // "מייל נוסף" must stay empty on this side too
       const more = String(form.email_more ?? '');
       checks.push({
-        name: 'web · /support_page מייל נוסף empty',
+        name: 'web · profile מייל נוסף empty',
         value: more.trim() ? more.slice(0, 24) : 'empty',
         ok: !more.trim(),
       });
     } catch (e: any) {
       checks.push({
-        name: 'web · /support_page',
+        name: 'web · profile',
         value: 'unreachable',
         ok: true,
         info: true,
@@ -502,65 +535,63 @@ export class HtzClient {
     return { ok: checks.filter((c) => !c.info).every((c) => c.ok), checks, user };
   }
 
-  /** Every serializable field of the /support_page "my details" form. */
+  /** The web profile in the flat shape the rest of the code expects. */
   async webForm(): Promise<DetailsForm> {
-    try {
-      return await this.readDetailsForm();
-    } catch {
-      // a lapsed session renders the page without our details block
-      await this.ensureWebSession(true);
-      return this.readDetailsForm();
-    }
+    const u = await this.webProfile();
+    const s = (v: any) => (v === null || v === undefined ? '' : String(v));
+    return {
+      telephone: s(u.phone),
+      phone: s(u.phone),
+      email_more: s(u.email_2),
+      city: s(u.city),
+      city_id: s(u.city_id),
+      tz_number: s(u.tz_number),
+      first_name: s(u.first_name),
+      last_name: s(u.last_name),
+      birth_day: s(u.birth_day),
+      birth_month: s(u.birth_month),
+      sex_id: s(u.sex_id),
+    };
   }
 
-  private async readDetailsForm(): Promise<DetailsForm> {
-    const html = await this.webGet('/support_page');
-    const anchor = html.indexOf('"next_step":"details_form"');
-    if (anchor < 0) throw new Error('details form marker not found on /support_page');
-
-    // the section is a JSON-escaped HTML string; unescape it exactly
-    const tail = html.slice(anchor);
-    const marker = '"section_html":"';
-    const i = tail.indexOf(marker);
-    if (i < 0) throw new Error('section_html not found for the details form');
-    const buf: string[] = [];
-    let j = i + marker.length;
-    while (j < tail.length) {
-      const ch = tail[j];
-      if (ch === '\\' && j + 1 < tail.length) {
-        buf.push(tail[j], tail[j + 1]);
-        j += 2;
-        continue;
-      }
-      if (ch === '"') break;
-      buf.push(ch);
-      j += 1;
-    }
-    let section = '';
-    try {
-      section = JSON.parse('"' + buf.join('') + '"');
-    } catch {
-      throw new Error('could not decode the details section');
-    }
-    if (!section.includes('telephone')) throw new Error('details section has no telephone field');
-
-    const form = section.match(/<form[^>]*class=['"]update['"][^>]*>([\s\S]*?)<\/form>/i);
-    return parseFormFields(form ? form[1] : section);
+  /** Cached profile, refreshed at most every five minutes. */
+  async webProfile(force = false): Promise<any> {
+    if (!force && this.webUser && Date.now() - this.webUserAt < 5 * 60_000) return this.webUser;
+    await this.webLogin();
+    return this.webUser ?? {};
   }
 
   /**
-   * Set `telephone` on the website. The endpoint REPLACES the record, so empty
-   * form fields are filled from the app record first and anything that would be
-   * blanked is refused.
+   * Set the phone on the website.
+   *
+   * `POST /api/profile/update` takes the whole profile as JSON (the legacy form
+   * replace is gone), so the body carries every field we know plus
+   * `phone`/`email_2`, which the site maps from its own form.
    */
   async webApplyPhone(phone: string, appRecord?: User): Promise<{ filled: string[]; before: DetailsForm; after: DetailsForm }> {
+    const u = await this.webProfile(true);
     const before = await this.webForm();
-    if (!('telephone' in before)) throw new Error('no telephone field in the details form');
 
-    const payload: DetailsForm = { ...before, telephone: phone };
+    const s = (v: any) => (v === null || v === undefined ? '' : String(v));
+    const payload: Record<string, any> = {
+      telephone: phone,
+      phone,
+      email_more: '',
+      email_2: '',
+      first_name: s(u.first_name),
+      last_name: s(u.last_name),
+      city: s(u.city),
+      city_id: s(u.city_id),
+      birth_day: s(u.birth_day),
+      birth_month: s(u.birth_month),
+      sex_id: s(u.sex_id),
+    };
+    // the ID number is locked on most accounts; send it only when the site allows it
+    if (!u.tz_locked) payload.tz_number = s(u.tz_number);
+
     const filled: string[] = [];
     if (appRecord) {
-      for (const key of Object.keys(payload)) {
+      for (const key of ['first_name', 'last_name', 'city', 'city_id', 'tz_number', 'birth_day', 'birth_month']) {
         if (String(payload[key] ?? '').trim()) continue;
         const appVal = (appRecord as any)[key];
         if ((typeof appVal === 'string' || typeof appVal === 'number') && String(appVal).trim() && String(appVal) !== '0') {
@@ -570,13 +601,37 @@ export class HtzClient {
       }
     }
 
-    const risky = Object.keys(before).filter((k) => String(before[k] ?? '').trim() && !String(payload[k] ?? '').trim());
-    if (risky.length) throw new Error('refusing to blank fields: ' + risky.join(', '));
+    const url = `${WEB}/api/profile/update`;
+    const res = await withTimeout(
+      fetch(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Referer: `${WEB}/support_page`,
+          ...(this.cookieHeaderFor(url) ? { Cookie: this.cookieHeaderFor(url)! } : {}),
+        },
+        body: JSON.stringify(payload),
+        credentials: 'omit',
+      }),
+      30000,
+    );
+    this.absorb(res, url);
+    const text = await res.text();
+    let json: any = {};
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`web update: non-JSON response (${res.status}) ${text.slice(0, 120)}`);
+    }
+    const err = json?.error?.message || json?.error?.code || (res.ok ? '' : `status ${res.status}`);
+    if (err) throw new Error('web update: ' + String(err));
 
-    const res = await this.webAjax('user_service', 'register_form_update', payload, '/support_page', 'action');
-    const err = (res?.err ?? '').toString().trim();
-    if (err) throw new Error('web update: ' + err);
-
+    // the write returns the updated record — use it, then confirm with a fresh read
+    if (json?.data) {
+      this.webUser = json.data;
+      this.webUserAt = Date.now();
+    }
     const after = await this.webForm();
     return { filled, before, after };
   }

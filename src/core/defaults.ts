@@ -26,6 +26,8 @@ export type Defaults = {
   background: boolean;
   /** log in from scratch before the first order of a batch */
   freshLogin: boolean;
+  /** how many 429s may be absorbed by rebuilding the cart */
+  rateLimitRetries: number;
   /** which surfaces a set-phone run touches */
   mode: RunMode;
 };
@@ -41,6 +43,7 @@ export const BUILT_IN: Defaults = {
   dryRun: true,
   background: true,
   freshLogin: true,
+  rateLimitRetries: 2,
   mode: 'both-web',
 };
 
@@ -76,6 +79,7 @@ export function normalize(raw: any): Defaults {
     dryRun: typeof r.dryRun === 'boolean' ? r.dryRun : BUILT_IN.dryRun,
     background: typeof r.background === 'boolean' ? r.background : BUILT_IN.background,
     freshLogin: typeof r.freshLogin === 'boolean' ? r.freshLogin : BUILT_IN.freshLogin,
+    rateLimitRetries: clampInt(r.rateLimitRetries, BUILT_IN.rateLimitRetries, 0, 5),
     mode: MODES.includes(r.mode) ? (r.mode as RunMode) : BUILT_IN.mode,
   };
 }

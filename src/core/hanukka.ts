@@ -48,6 +48,8 @@ export type HanukkaOptions = {
   session?: HanukkaSession;
   /** Force a fresh login before the first order of the batch (default true). */
   freshLogin?: boolean;
+  /** How many times a 429 may be absorbed by rebuilding the cart (default 2). */
+  retryOnRateLimit?: number;
   /** Ignore the cache and reload the item page once. */
   forceReload?: boolean;
   shouldStop?: () => boolean;
@@ -329,37 +331,71 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     if (stopped()) return abort('cart add');
 
     // ---- cart ----------------------------------------------------------
-    const cleared = await client.webApi('DELETE', '/api/cart?kind=quick');
-    if (cleared.status >= 400) {
-      add('cart clear', false, HtzClient.apiError(cleared));
-      return { ok: false, steps, variants, error: HtzClient.apiError(cleared) };
-    }
+    // Rebuilt on demand: the store rate-limits aggressively, and a 429 in the
+    // middle of seeding leaves a half-filled cart, so recovery is always
+    // "clear, add everything again, retry the step".
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const rateLimited = (res: { status: number; json: any }) =>
+      res.status === 429 || res.json?.error?.code === 'too_many_requests';
+    const retryAfterMs = (res: { json: any }, attempt: number) => {
+      const hinted = Number(res?.json?.error?.retry_after ?? 0);
+      return hinted > 0 ? hinted * 1000 : Math.min(30000, 4000 * (attempt + 1));
+    };
 
-    let units = 0;
-    for (const l of wanted) {
-      const res = await client.webApi('POST', '/api/cart/items', {
-        kind: 'quick',
-        product_id: Number(item),
-        quantity: l.qty,
-        variant_id: l.id,
-      });
-      if (res.status >= 400 || res.json?.error) {
-        const detail = HtzClient.apiError(res);
-        add('cart add', false, `${l.id}×${l.qty}: ${detail}`);
-        return { ok: false, steps, variants, error: detail };
+    const seedCart = async (): Promise<{ ok: boolean; units: number; total: number; lines: number; error?: string; limited?: boolean }> => {
+      const cleared = await client.webApi('DELETE', '/api/cart?kind=quick');
+      if (rateLimited(cleared)) return { ok: false, units: 0, total: 0, lines: 0, error: HtzClient.apiError(cleared), limited: true };
+      if (cleared.status >= 400) return { ok: false, units: 0, total: 0, lines: 0, error: HtzClient.apiError(cleared) };
+
+      let added = 0;
+      for (const l of wanted) {
+        const res = await client.webApi('POST', '/api/cart/items', {
+          kind: 'quick',
+          product_id: Number(item),
+          quantity: l.qty,
+          variant_id: l.id,
+        });
+        if (rateLimited(res)) {
+          return { ok: false, units: 0, total: 0, lines: 0, error: `${l.id}×${l.qty}: ${HtzClient.apiError(res)}`, limited: true };
+        }
+        if (res.status >= 400 || res.json?.error) {
+          return { ok: false, units: 0, total: 0, lines: 0, error: `${l.id}×${l.qty}: ${HtzClient.apiError(res)}` };
+        }
+        added += l.qty;
       }
-      units += l.qty;
+
+      const cart = await client.webApi('GET', '/api/cart?kind=quick');
+      if (rateLimited(cart)) return { ok: false, units: 0, total: 0, lines: 0, error: HtzClient.apiError(cart), limited: true };
+      const cdata = cart.json?.data || {};
+      const cartLines = (cdata.lines || []) as any[];
+      if (!cartLines.length) {
+        return { ok: false, units: 0, total: 0, lines: 0, error: 'cart is empty after adding (stock / per-member limit)' };
+      }
+      return {
+        ok: true,
+        units: Number(cdata.checkout?.units ?? cdata.count ?? added),
+        total: Number(cdata.total || cdata.checkout?.totalSum || 0),
+        lines: cartLines.length,
+      };
+    };
+
+    const maxRateLimitRetries = Math.max(0, Math.min(5, opts.retryOnRateLimit ?? 2));
+    let seeded = await seedCart();
+    for (let attempt = 0; !seeded.ok && seeded.limited && attempt < maxRateLimitRetries; attempt++) {
+      const waitMs = retryAfterMs(seeded as any, attempt);
+      add('rate limit', false, `cart seed throttled — rebuilding in ${Math.round(waitMs / 1000)}s (${attempt + 1}/${maxRateLimitRetries})`);
+      await sleep(waitMs);
+      if (stopped()) return abort('cart retry');
+      seeded = await seedCart();
+    }
+    if (!seeded.ok) {
+      add('cart add', false, seeded.error || 'cart could not be filled');
+      return { ok: false, steps, variants, error: seeded.error || 'cart could not be filled' };
     }
 
-    const cart = await client.webApi('GET', '/api/cart?kind=quick');
-    const cdata = cart.json?.data || {};
-    const cartLines = (cdata.lines || []) as any[];
-    const total = Number(cdata.total || cdata.checkout?.totalSum || 0);
-    const cartUnits = Number(cdata.checkout?.units ?? cdata.count ?? units);
-    if (!cartLines.length) {
-      add('cart add', false, 'cart is empty after adding (stock / per-member limit)');
-      return { ok: false, steps, variants, error: 'cart stayed empty — per-member limit reached' };
-    }
+    const units = seeded.units;
+    const total = seeded.total;
+    const cartUnits = seeded.units;
     add('cart add', true, `${cartUnits} unit(s) · ₪${total}`);
 
     const draftBody = {
@@ -381,29 +417,99 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
     }
     if (stopped()) return abort('order draft');
 
-    // ---- draft ---------------------------------------------------------
-    const draft = await client.webApi('POST', '/api/orders/draft', draftBody);
-    if (draft.status >= 400 || draft.json?.error) {
-      const detail = HtzClient.apiError(draft);
-      add('order draft', false, detail);
-      return { ok: false, steps, variants, payload: preview, error: detail, raw: draft.json };
-    }
-    const orderId = Number(draft.json?.data?.id || 0);
-    const draftTotal = Number(draft.json?.data?.totals?.total ?? total);
-    add('order draft', true, `order ${orderId} · ₪${draftTotal}${draft.json?.data?.payment?.card_required ? ' · card required' : ''}`);
-    if (stopped()) return abort('payment session');
+    // ---- draft + payment, with rate-limit recovery ---------------------
+    // 429 is answered by rebuilding the cart (clear + add again) and retrying
+    // the step, because a throttled request often leaves the cart in a state
+    // the next call refuses.
+    let orderId = 0;
+    let draftTotal = total;
+    let payRaw: any = null;
+    let verdict: { ok: boolean; relocation?: string; cardUrl?: string; error?: string } = { ok: false };
+    let gaveUp = false;
 
-    // ---- payment session (card entry) ----------------------------------
-    const pay = await client.webApi('POST', '/api/orders/payment-session', { order_id: orderId });
-    const verdict = interpretPayResponse(pay.json);
-    if (!verdict.ok) {
-      const detail = verdict.error || HtzClient.apiError(pay);
-      add('payment', false, detail.slice(0, 160));
-      return { ok: false, steps, variants, payload: preview, orderId, total: draftTotal, error: detail, raw: pay.json };
+    for (let attempt = 0; attempt <= maxRateLimitRetries && !verdict.ok && !gaveUp; attempt++) {
+      const draft = await client.webApi('POST', '/api/orders/draft', draftBody);
+
+      if (rateLimited(draft)) {
+        const waitMs = retryAfterMs(draft, attempt);
+        add(
+          'rate limit',
+          false,
+          `order draft throttled — rebuilding the cart in ${Math.round(waitMs / 1000)}s (${attempt + 1}/${maxRateLimitRetries})`,
+        );
+        await sleep(waitMs);
+        if (stopped()) return abort('draft retry');
+        const rebuilt = await seedCart();
+        if (!rebuilt.ok) {
+          add('cart add', false, rebuilt.error || 'could not rebuild the cart');
+          return { ok: false, steps, variants, payload: preview, error: rebuilt.error || 'cart rebuild failed' };
+        }
+        add('cart add', true, `${rebuilt.units} unit(s) · ₪${rebuilt.total} (rebuilt)`);
+        continue;
+      }
+
+      if (draft.status >= 400 || draft.json?.error) {
+        const detail = HtzClient.apiError(draft);
+        add('order draft', false, detail);
+        return { ok: false, steps, variants, payload: preview, error: detail, raw: draft.json };
+      }
+
+      orderId = Number(draft.json?.data?.id || 0);
+      draftTotal = Number(draft.json?.data?.totals?.total ?? total);
+      add('order draft', true, `order ${orderId} · ₪${draftTotal}${draft.json?.data?.payment?.card_required ? ' · card required' : ''}`);
+      if (stopped()) return abort('payment session');
+
+      let pay = await client.webApi('POST', '/api/orders/payment-session', { order_id: orderId });
+
+      if (rateLimited(pay)) {
+        const waitMs = retryAfterMs(pay, attempt);
+        add('rate limit', false, `payment throttled — retrying in ${Math.round(waitMs / 1000)}s`);
+        await sleep(waitMs);
+        pay = await client.webApi('POST', '/api/orders/payment-session', { order_id: orderId });
+      }
+
+      if (rateLimited(pay)) {
+        add('rate limit', false, 'still throttled — rebuilding the cart and drafting again');
+        const rebuilt = await seedCart();
+        if (!rebuilt.ok) {
+          add('cart add', false, rebuilt.error || 'could not rebuild the cart');
+          return {
+            ok: false,
+            steps,
+            variants,
+            payload: preview,
+            orderId,
+            total: draftTotal,
+            error: rebuilt.error || 'cart rebuild failed',
+          };
+        }
+        add('cart add', true, `${rebuilt.units} unit(s) · ₪${rebuilt.total} (rebuilt)`);
+        continue;
+      }
+
+      payRaw = pay.json;
+      verdict = interpretPayResponse(pay.json);
+      if (!verdict.ok) gaveUp = true;
     }
+
+    if (!verdict.ok) {
+      const detail = verdict.error || HtzClient.apiError({ status: 0, json: payRaw }) || 'payment failed';
+      add('payment', false, detail.slice(0, 160));
+      return {
+        ok: false,
+        steps,
+        variants,
+        payload: preview,
+        orderId,
+        total: draftTotal,
+        error: detail,
+        raw: payRaw,
+      };
+    }
+
     if (verdict.relocation) {
       add('payment', true, `next → ${verdict.relocation}`);
-      return { ok: true, steps, variants, payload: preview, orderId, total: draftTotal, relocation: verdict.relocation, raw: pay.json };
+      return { ok: true, steps, variants, payload: preview, orderId, total: draftTotal, relocation: verdict.relocation, raw: payRaw };
     }
     add('payment', true, 'order staged — card entry required');
     if (verdict.cardUrl) log(`CARD PAYMENT REQUIRED -> ${verdict.cardUrl}`);
@@ -416,7 +522,7 @@ export async function runHanukka(client: HtzClient, opts: HanukkaOptions): Promi
       total: draftTotal,
       units: cartUnits,
       cardUrl: verdict.cardUrl,
-      raw: pay.json,
+      raw: payRaw,
     };
   } catch (e: any) {
     add('error', false, e?.message ?? String(e));

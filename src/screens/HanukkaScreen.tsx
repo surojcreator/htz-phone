@@ -107,6 +107,7 @@ export default function HanukkaScreen() {
           dryRun,
           session,
           freshLogin,
+          retryOnRateLimit: defaults.rateLimitRetries,
           forceReload: reload && i > 1,
           shouldStop: () => cancelRef.current,
           log: push,

@@ -23,6 +23,7 @@ export default function SettingsScreen() {
   const [dryRun, setDryRun] = useState(defaults.dryRun);
   const [background, setBackground] = useState(defaults.background);
   const [freshLogin, setFreshLogin] = useState(defaults.freshLogin);
+  const [rlRetries, setRlRetries] = useState(String(defaults.rateLimitRetries));
   const [mode, setMode] = useState(defaults.mode);
   const [touched, setTouched] = useState(false);
   const [notice, setNotice] = useState('');
@@ -40,6 +41,7 @@ export default function SettingsScreen() {
     setDryRun(defaults.dryRun);
     setBackground(defaults.background);
     setFreshLogin(defaults.freshLogin);
+    setRlRetries(String(defaults.rateLimitRetries));
     setMode(defaults.mode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
@@ -52,7 +54,9 @@ export default function SettingsScreen() {
   const repeatsOk = Number.isFinite(repeatsNum) && repeatsNum >= 1 && repeatsNum <= 50;
   const delayOk = Number.isFinite(delayNum) && delayNum >= 0;
   const itemOk = /^\d{3,}$/.test(itemId.trim());
-  const canSave = phoneCheck.ok && orderCheck.ok && qtyCheck.ok && repeatsOk && delayOk && itemOk;
+  const rlNum = parseInt(rlRetries, 10);
+  const rlOk = Number.isFinite(rlNum) && rlNum >= 0 && rlNum <= 5;
+  const canSave = phoneCheck.ok && orderCheck.ok && qtyCheck.ok && repeatsOk && delayOk && itemOk && rlOk;
 
   async function save() {
     if (!canSave) {
@@ -70,6 +74,7 @@ export default function SettingsScreen() {
       dryRun,
       background,
       freshLogin,
+      rateLimitRetries: rlNum,
       mode,
     });
     setTouched(false);
@@ -90,6 +95,7 @@ export default function SettingsScreen() {
     setDryRun(BUILT_IN.dryRun);
     setBackground(BUILT_IN.background);
     setFreshLogin(BUILT_IN.freshLogin);
+    setRlRetries(String(BUILT_IN.rateLimitRetries));
     setMode(BUILT_IN.mode);
   }
 
@@ -165,6 +171,15 @@ export default function SettingsScreen() {
         keyboard="number-pad"
         placeholder={String(BUILT_IN.delay)}
         error={delay.length > 0 && !delayOk ? '0 or more' : undefined}
+      />
+
+      <Field
+        label="429 retries (rebuild cart and retry)"
+        value={rlRetries}
+        onChange={(v) => { mark(); setRlRetries(v); }}
+        keyboard="number-pad"
+        placeholder={String(BUILT_IN.rateLimitRetries)}
+        error={rlRetries.length > 0 && !rlOk ? '0 to 5' : undefined}
       />
 
       <Text style={[styles.label, { marginTop: 18 }]}>Set phone run mode</Text>

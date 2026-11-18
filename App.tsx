@@ -3,6 +3,7 @@ import React, { useState } from 'react';
 import { Platform, Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
 
 import HanukkaScreen from './src/screens/HanukkaScreen';
+import ProductScreen from './src/screens/ProductScreen';
 import SetPhoneScreen from './src/screens/SetPhoneScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import VerifyScreen from './src/screens/VerifyScreen';
@@ -10,12 +11,13 @@ import { CredentialsProvider } from './src/ui/credentials';
 import { DefaultsProvider } from './src/ui/defaults';
 import { theme } from './src/ui/theme';
 
-type Tab = 'set' | 'verify' | 'hanukka' | 'settings';
+type Tab = 'set' | 'verify' | 'hanukka' | 'buy' | 'settings';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'set', label: 'Set phone' },
   { id: 'verify', label: 'Verify' },
   { id: 'hanukka', label: 'חנוכה' },
+  { id: 'buy', label: 'Buy' },
   { id: 'settings', label: 'Defaults' },
 ];
 
@@ -59,6 +61,9 @@ export default function App() {
           </View>
           <View style={[styles.pane, tab !== 'hanukka' && styles.hidden]}>
             <HanukkaScreen />
+          </View>
+          <View style={[styles.pane, tab !== 'buy' && styles.hidden]}>
+            <ProductScreen />
           </View>
           <View style={[styles.pane, tab !== 'settings' && styles.hidden]}>
             <SettingsScreen />

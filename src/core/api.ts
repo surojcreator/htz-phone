@@ -18,7 +18,17 @@
  */
 import { decryptString, encryptString } from './crypto';
 
-export const APP_API = 'https://cms.htzone.co.il/api/android/1.6/';
+/**
+ * Mobile API hosts, in the order the official app uses them.
+ *
+ * The current app talks to `api.htzone.co.il`; `cms.htzone.co.il` still serves
+ * the identical 1.6 method family and is kept as a fallback.
+ */
+export const APP_HOSTS = [
+  'https://api.htzone.co.il/api/android/1.6/',
+  'https://cms.htzone.co.il/api/android/1.6/',
+];
+export const APP_API = APP_HOSTS[0];
 export const WEB = 'https://www.htzone.co.il';
 
 export type User = Record<string, any>;
@@ -798,10 +808,21 @@ export class HtzClient {
 
   /** App API login. Credentials are encrypted exactly like the native app does. */
   async appLogin(): Promise<User> {
-    const res = await this.postJson(`${APP_API}loginUser/`, {
+    const payload = {
       email: await encryptString(this.email),
       password: await encryptString(this.password),
-    });
+    };
+    let res: any = null;
+    let lastErr: any = null;
+    for (const host of APP_HOSTS) {
+      try {
+        res = await this.postJson(`${host}loginUser/`, payload);
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!res) throw new Error(`app login unreachable: ${lastErr?.message ?? 'no host answered'}`);
     if (res?.status !== 1) {
       const msg = res?.err?.content || JSON.stringify(res).slice(0, 160);
       const hint = /סיסמא|סיסמה|נכונים/.test(String(msg))
@@ -899,7 +920,17 @@ export class HtzClient {
       for (const [k, v] of Object.entries(extra ?? {})) {
         if (v !== undefined && v !== null && String(v) !== '') payload[k] = String(v);
       }
-      const res = await this.postJson(`${APP_API}editUserInformation/`, payload);
+      let res: any = null;
+      let netErr: any = null;
+      for (const host of APP_HOSTS) {
+        try {
+          res = await this.postJson(`${host}editUserInformation/`, payload);
+          break;
+        } catch (e) {
+          netErr = e;
+        }
+      }
+      if (!res) throw new Error(`app update unreachable: ${netErr?.message ?? 'no host answered'}`);
       if (res?.status !== 1) {
         const err = res?.err ?? {};
         const message = err?.content || JSON.stringify(res).slice(0, 160);

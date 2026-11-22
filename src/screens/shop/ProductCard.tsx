@@ -60,7 +60,7 @@ function ProductCardInner({
             {item.reviews ? ` · ${item.reviews}` : ''}
           </Text>
         )}
-        {item.stockEmpty && <Text style={styles.out}>Out of stock</Text>}
+        {item.stockEmpty && <Text style={styles.out}>Check availability</Text>}
       </Pressable>
 
       {onToggleFavorite && (

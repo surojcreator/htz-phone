@@ -342,13 +342,16 @@ async function readWebDetail(client: HtzClient, item: CatalogItem): Promise<Prod
   const fullPrice = ref.fullPrice && ref.fullPrice > 0 ? ref.fullPrice : item.fullPrice;
   const images = [ref.image, item.image].filter((v): v is string => !!v);
   const inStock = ref.variants.filter((v) => v.inStock !== false);
+  // The website is authoritative for availability: the app API marks products
+  // it cannot sell as stock_empty even when the PDP says "add to cart".
+  const webAvailable = ref.available === true || (ref.ctaKind === 'add_to_cart' && ref.available !== false);
   return {
     ...item,
     title: ref.title && ref.title !== String(item.id) ? ref.title : item.title,
     price,
     fullPrice,
-    stockEmpty: ref.variants.length ? !inStock.length : item.stockEmpty,
-    canBuy: item.canBuy !== false && (!ref.variants.length || inStock.length > 0),
+    stockEmpty: webAvailable ? false : ref.variants.length ? !inStock.length : item.stockEmpty,
+    canBuy: webAvailable ? true : item.canBuy !== false && (!ref.variants.length || inStock.length > 0),
     image: images[0] ?? item.image,
     images: images.length ? images : [item.image].filter(Boolean),
     description: ref.description ?? '',

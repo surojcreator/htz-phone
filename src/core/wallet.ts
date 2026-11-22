@@ -32,6 +32,13 @@ export type ProductRef = {
   /** the PDP's own per-order cap, used when a variant row carries no max */
   maxPurchase?: number;
   addressRequired: boolean;
+  /**
+   * The product page's own availability flag. Items without models (a TV, a
+   * voucher with one SKU) have no `priceOptions`, and the app API often marks
+   * them `stock_empty` — the website still sells them, so this wins.
+   */
+  available?: boolean;
+  ctaKind?: string;
 };
 
 export type CartLine = {
@@ -227,6 +234,16 @@ export function parseProductPage(ref: { kind: 'quick' | 'regular'; id: number },
   }
 
   const priced = variants.filter((v) => v.price > 0).map((v) => v.price);
+
+  // Availability and a price for variant-less products live outside the option
+  // arrays: `isAvailable` / `ctaKind` / `sf.price`.
+  const availMatch = flat.match(/"isAvailable"\s*:\s*(true|false)/);
+  const available = availMatch ? availMatch[1] === 'true' : undefined;
+  const ctaKind = (flat.match(/"ctaKind"\s*:\s*"([a-z_]+)"/) || [])[1];
+  const flatPrice =
+    Number((flat.match(/"sf"\s*:\s*\{[^}]*?"price"\s*:\s*(\d+)/) || [])[1] ?? 0) ||
+    Number((flat.match(/"item"\s*:\s*\{[^}]*?"price"\s*:\s*(\d+)/) || [])[1] ?? 0) ||
+    0;
   const image =
     (flat.match(/"ogImage":"([^"]+)"/) || [])[1] ||
     (flat.match(/"main_media[^"]*":"(https?:[^"]+)"/) || [])[1] ||
@@ -242,12 +259,14 @@ export function parseProductPage(ref: { kind: 'quick' | 'regular'; id: number },
     kind: ref.kind,
     id: ref.id,
     title: title.replace(/\\(["\\])/g, '$1').trim(),
-    price: priced.length ? Math.min(...priced) : undefined,
+    price: priced.length ? Math.min(...priced) : flatPrice || undefined,
     fullPrice: Number((flat.match(/"fullPrice"\s*:\s*(\d+)/) || [])[1] ?? 0) || undefined,
     image,
     description,
     limitNote,
     variants,
+    available,
+    ctaKind,
     maxPurchase,
     addressRequired: /"addressRequired":true/.test(flat),
   };

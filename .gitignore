@@ -9,3 +9,6 @@ _expo/
 *.err.log
 *.keystore
 .parsecheck/
+
+# browser profiles created by the audit tooling
+.cf-*/

@@ -295,11 +295,24 @@ export async function readProductWebview(
   const id = parsed?.id ?? Number(s);
   if (!id) throw new Error('could not read a product id');
   const k = kind ?? parsed?.kind ?? 'regular';
-  const html = await client.webGet(`/webview/${id}`);
-  const first = parseProductPage({ kind: k, id }, html);
-  if (first.variants.length) return first;
+
+  // Cloudflare sometimes answers with a challenge page instead of the PDP; it
+  // used to be read as "no product / sold out". Retry, then say so plainly.
+  const challenged = (html: string) => /Just a moment|cf-chl|challenge-platform/i.test(html) && html.length < 20000;
+  const fetchPage = async (path: string): Promise<string> => {
+    let html = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      html = await client.webGet(path);
+      if (!challenged(html)) return html;
+      await new Promise((r) => setTimeout(r, 900 + attempt * 1200));
+    }
+    throw new Error('the store is challenging requests right now — try again in a minute');
+  };
+
+  const first = parseProductPage({ kind: k, id }, await fetchPage(`/webview/${id}`));
+  if (first.variants.length || first.available) return first;
   const path = k === 'quick' ? `/wallet_attraction_item/${id}` : `/item/${id}/`;
-  const alt = await client.webGet(path);
+  const alt = await fetchPage(path);
   return parseProductPage({ kind: k, id }, alt);
 }
 
@@ -315,11 +328,12 @@ export type AddResult = {
 
 function addFailure(res: { status: number; json: any }): AddResult {
   const e = res?.json?.error;
+  const d = e?.details || {};
   return {
     ok: false,
     code: e?.code,
-    limit: e?.details?.limit != null ? Number(e.details.limit) : undefined,
-    remaining: e?.details?.remaining != null ? Number(e.details.remaining) : undefined,
+    limit: d.limit != null ? Number(d.limit) : d.max_purchase != null ? Number(d.max_purchase) : undefined,
+    remaining: d.remaining != null ? Number(d.remaining) : undefined,
     error: HtzClient.apiError(res),
   };
 }
@@ -330,6 +344,13 @@ export function addErrorText(res: AddResult): string {
     return res.limit
       ? `הגעת למכסת הרכישה של מוצר זה (${res.limit})`
       : 'הגעת למכסת הרכישה של מוצר זה';
+  }
+  // Hitting the per-order cap is the other half of the same wall: this one is
+  // about quantity in this cart, the one above about lifetime purchases.
+  if (res.code === 'over_purchase_limit') {
+    return res.limit
+      ? `הגעת לכמות המקסימלית לרכישה של מוצר זה (עד ${res.limit})`
+      : 'הגעת לכמות המקסימלית לרכישה של מוצר זה';
   }
   if (res.code === 'variant_required') return 'יש לבחור דגם לפני ההוספה לסל';
   if (res.code === 'out_of_stock' || res.code === 'sold_out') return 'המוצר אזל מהמלאי';
@@ -375,6 +396,17 @@ export async function addToCart(
     }
   };
 
+  // The website cart is the reference: it carries an explicit quantity and it
+  // enforces the store's per-order caps. The native add is only a fallback for
+  // items the website refuses to place in the cart at all.
+  const web = await webAdd();
+  if (web.ok) return web;
+
+  const storeSaidNo = ['over_purchase_limit', 'purchase_limit_reached', 'cart_empty', 'unauthenticated', 'variant_required'].includes(
+    String(web.code ?? ''),
+  );
+  if (storeSaidNo) return web;
+
   try {
     const collected = opts.variantId ? [{ id: opts.variantId, quantity: opts.qty }] : undefined;
     const data = await client.appAddToCart({
@@ -384,22 +416,16 @@ export async function addToCart(
       ...(collected ? { collectedIds: collected } : {}),
     });
     const popup = data?.popupObject;
-    if (popup && typeof popup === 'object' && Object.keys(popup).length > 0) {
-      // Items the native cart wants extra validation for can usually be added
-      // through the website cart.
-      return await webAdd();
-    }
     const extra = data?.required_additional_fields;
-    if (extra && typeof extra === 'object' && Object.keys(extra).length > 0) {
-      return await webAdd();
+    if ((popup && typeof popup === 'object' && Object.keys(popup).length > 0) ||
+        (extra && typeof extra === 'object' && Object.keys(extra).length > 0)) {
+      return web;
     }
     return { ok: true };
   } catch (e: any) {
-    // Native add rejects webview-only / lead-style items. Try the website cart
-    // before reporting "cannot purchase".
-    const native = e?.message ?? String(e);
-    const web = await webAdd();
-    return web.ok ? web : { ...web, error: web.error || native };
+    // Native add rejects webview-only / lead-style items too — report the
+    // website's error, it is the clearer one.
+    return web;
   }
 }
 

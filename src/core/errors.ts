@@ -11,6 +11,7 @@ const KNOWN: Record<string, string> = {
   validation_failed: 'the store rejected the values',
   variant_required: 'choose a model for this product first',
   purchase_limit_reached: 'you already bought the maximum of this item',
+  over_purchase_limit: 'that is more than this item allows per order',
   cart_empty: 'the cart is empty',
   cart_checkout_in_progress: 'another checkout is open on this cart',
   cart_not_valid: 'the cart changed — it needs rebuilding',
@@ -39,6 +40,9 @@ export function friendlyError(input: any): string {
 
   if (code === 'purchase_limit_reached') {
     return `${base} (limit ${details.limit ?? '?'}, remaining ${details.remaining ?? 0})`;
+  }
+  if (code === 'over_purchase_limit') {
+    return `${base} (max ${details.max_purchase ?? '?'} per order)`;
   }
   if (code === 'rate_limit' || code === 'too_many_requests') return KNOWN.too_many_requests;
   if (base) return base;

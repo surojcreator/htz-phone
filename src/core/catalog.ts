@@ -70,6 +70,10 @@ export type ProductDetail = CatalogItem & {
   /** PDP wording for the purchase cap, when the product publishes one */
   limitNote?: string;
   variants: { id: number; price: number; label: string; max?: number; stock?: number; inStock?: boolean }[];
+  /** Coinz redemption terms from the PDP */
+  redeemsCoinz?: boolean;
+  coinValue?: number;
+  coinzCapPct?: number;
 };
 
 export type SortMode = 'relevance' | 'price-asc' | 'price-desc' | 'rating' | 'name';
@@ -366,6 +370,9 @@ async function readWebDetail(client: HtzClient, item: CatalogItem): Promise<Prod
     itemUrl: `https://www.htzone.co.il/webview/${item.id}`,
     savingsPct: fullPrice > price && fullPrice > 0 ? Math.round((1 - price / fullPrice) * 100) : 0,
     variants: ref.variants,
+    redeemsCoinz: ref.redeemsCoinz,
+    coinValue: ref.coinValue,
+    coinzCapPct: ref.coinzCapPct,
   };
 }
 

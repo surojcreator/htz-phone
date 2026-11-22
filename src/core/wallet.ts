@@ -39,6 +39,11 @@ export type ProductRef = {
    */
   available?: boolean;
   ctaKind?: string;
+  /** Coinz: 1 point = `coinValue` ILS, redeemable up to `capPct`% of the line */
+  redeemsCoinz?: boolean;
+  coinValue?: number;
+  coinzCapPct?: number;
+  coinzMinPct?: number;
 };
 
 export type CartLine = {
@@ -244,6 +249,13 @@ export function parseProductPage(ref: { kind: 'quick' | 'regular'; id: number },
     Number((flat.match(/"sf"\s*:\s*\{[^}]*?"price"\s*:\s*(\d+)/) || [])[1] ?? 0) ||
     Number((flat.match(/"item"\s*:\s*\{[^}]*?"price"\s*:\s*(\d+)/) || [])[1] ?? 0) ||
     0;
+
+  // Coinz: the PDP declares whether the item accepts points and the cap.
+  const redeemsCoinz = /"redeemsCoinz"\s*:\s*true/.test(flat);
+  const coinBlock = flat.match(/"coinz"\s*:\s*\{\s*"coinValue"\s*:\s*(\d+)\s*,\s*"capPct"\s*:\s*(\d+)\s*,\s*"minPct"\s*:\s*(\d+)/);
+  const coinValue = coinBlock ? Number(coinBlock[1]) : undefined;
+  const coinzCapPct = coinBlock ? Number(coinBlock[2]) : undefined;
+  const coinzMinPct = coinBlock ? Number(coinBlock[3]) : undefined;
   const image =
     (flat.match(/"ogImage":"([^"]+)"/) || [])[1] ||
     (flat.match(/"main_media[^"]*":"(https?:[^"]+)"/) || [])[1] ||
@@ -267,6 +279,10 @@ export function parseProductPage(ref: { kind: 'quick' | 'regular'; id: number },
     variants,
     available,
     ctaKind,
+    redeemsCoinz,
+    coinValue,
+    coinzCapPct,
+    coinzMinPct,
     maxPurchase,
     addressRequired: /"addressRequired":true/.test(flat),
   };
@@ -316,6 +332,18 @@ export async function readProductWebview(
   return parseProductPage({ kind: k, id }, alt);
 }
 
+/**
+ * How many points a single line can absorb: 1 point = `coinValue` ILS, capped at
+ * `capPct`% of the line price. 0 means the item is not Coinz-eligible.
+ */
+export function maxCoinzFor(opts: { price: number; coinValue?: number; coinzCapPct?: number }): number {
+  const pct = Number(opts.coinzCapPct ?? 0);
+  const unit = Number(opts.coinValue ?? 1) || 1;
+  const price = Number(opts.price ?? 0);
+  if (pct <= 0 || price <= 0) return 0;
+  return Math.floor((price * pct) / 100 / unit);
+}
+
 export type AddResult = {
   ok: boolean;
   error?: string;
@@ -360,7 +388,7 @@ export function addErrorText(res: AddResult): string {
 
 export async function addToCart(
   client: HtzClient,
-  opts: { kind: 'quick' | 'regular'; id: number; qty: number; variantId?: number; itemType?: number },
+  opts: { kind: 'quick' | 'regular'; id: number; qty: number; variantId?: number; itemType?: number; coinz?: number },
 ): Promise<AddResult> {
   const webAdd = async (): Promise<AddResult> => {
     try {
@@ -370,6 +398,10 @@ export async function addToCart(
         product_id: opts.id,
         quantity: opts.qty,
         ...(opts.variantId ? { variant_id: opts.variantId } : {}),
+        // Points to redeem for this line. The store silently ignores it when
+        // the item is not Coinz-eligible or the balance is short, so callers
+        // should only send what they computed as affordable.
+        ...(opts.coinz && opts.coinz > 0 ? { coinz: opts.coinz } : {}),
       };
       const res = await client.webApi('POST', '/api/cart/items', body);
       if (res.status < 400 && !res.json?.error) return { ok: true };

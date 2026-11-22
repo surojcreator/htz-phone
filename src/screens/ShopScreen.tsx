@@ -77,6 +77,7 @@ export default function ShopScreen({ onOpenCart, active }: Props) {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [variants, setVariants] = useState<ProductRef['variants']>([]);
   const [variantId, setVariantId] = useState<number | null>(null);
+  const [coinz, setCoinz] = useState(0);
   const [qty, setQty] = useState(1);
   const [cartKind, setCartKind] = useState<'regular' | 'quick'>('regular');
   const [comments, setComments] = useState<CommentsView | null>(null);
@@ -332,12 +333,15 @@ export default function ShopScreen({ onOpenCart, active }: Props) {
         return;
       }
 
+      const beforeTotal = (await readCart(c, cartKind).catch(() => null))?.total ?? 0;
+
       const res = await addToCart(c, {
         kind: cartKind,
         id: detail.id,
         qty,
         variantId: variantId ?? undefined,
         itemType: detail.typeId,
+        coinz: coinz > 0 ? coinz : undefined,
       });
       if (!res.ok) {
         setMessage(addErrorText(res));
@@ -353,11 +357,26 @@ export default function ShopScreen({ onOpenCart, active }: Props) {
       const sum = await readCart(c, cartKind).catch(() => null);
       const native = await readNativeCart(c).catch(() => null);
       setAdded(true);
+
+      // The store accepts `coinz` silently even with no points to spend; the
+      // cart total is the only honest signal, so compare it to the expected line.
+      let coinzNote = '';
+      if (coinz > 0) {
+        const unit = variants.find((v) => v.id === variantId)?.price ?? detail.price ?? 0;
+        const expected = unit * qty;
+        const covered = sum ? Math.max(0, expected - (sum.total - beforeTotal)) : 0;
+        coinzNote = covered > 0
+          ? ` · ${covered < 1 ? 'some' : '₪' + Math.round(covered)} paid with Coinz`
+          : ' · no Coinz applied (account has none to spend)';
+      }
+
       setMessage(
         `Added to the ${cartKind} cart` +
           (native ? ` · app cart ${native.lines.length} line(s)` : '') +
-          (sum ? ` · web cart ${sum.lines.length} line(s)` : ''),
+          (sum ? ` · web cart ${sum.lines.length} line(s)` : '') +
+          coinzNote,
       );
+      if (coinz > 0) setCoinz(0);
       refreshCartCount();
     } catch (e: any) {
       setMessage('Could not add: ' + (e?.message ?? String(e)));
@@ -518,6 +537,8 @@ export default function ShopScreen({ onOpenCart, active }: Props) {
               variants={variants}
               variantId={variantId}
               setVariantId={setVariantId}
+              coinz={coinz}
+              setCoinz={setCoinz}
               qty={qty}
               setQty={setQty}
               addBusy={addBusy}

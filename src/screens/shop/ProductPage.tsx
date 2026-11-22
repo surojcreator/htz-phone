@@ -14,7 +14,7 @@ import {
 } from 'react-native';
 
 import { CatalogItem, formatILS, ProductDetail } from '../../core/catalog';
-import { ProductRef } from '../../core/wallet';
+import { maxCoinzFor, ProductRef } from '../../core/wallet';
 import { theme } from '../../ui/theme';
 import { ProductCard } from './ProductCard';
 
@@ -27,6 +27,8 @@ type Props = {
   variants: ProductRef['variants'];
   variantId: number | null;
   setVariantId: (id: number) => void;
+  coinz: number;
+  setCoinz: (n: number) => void;
   qty: number;
   setQty: (n: number) => void;
   addBusy: boolean;
@@ -66,6 +68,8 @@ export function ProductPage(props: Props) {
     1,
     Math.min(999, selectedVariant?.max ?? d.maxPurchase ?? 999, stockForModel == null ? 999 : stockForModel || 1),
   );
+  const maxCoinz = maxCoinzFor({ price: unitPrice * props.qty, coinValue: d.coinValue, coinzCapPct: d.coinzCapPct });
+  const coinzAllowed = !!d.redeemsCoinz && maxCoinz > 0;
   const toggle = (key: string) => setOpen((s) => ({ ...s, [key]: !s[key] }));
 
   // A lower-stock model can reduce the allowed quantity.
@@ -165,6 +169,24 @@ export function ProductPage(props: Props) {
           <Text style={styles.limit}>{props.cartKind === 'quick' ? 'Quick cart' : 'Regular cart'}</Text>
         </View>
         {!!d.limitNote && <Text style={styles.limitNote}>ℹ {d.limitNote}</Text>}
+
+        {coinzAllowed && (
+          <View style={styles.coinzRow}>
+            <Text style={styles.coinzLabel}>Use Coinz</Text>
+            <TextInput
+              value={String(props.coinz || '')}
+              onChangeText={(t) => {
+                const n = Math.max(0, Math.min(maxCoinz, parseInt(t.replace(/\D/g, ''), 10) || 0));
+                props.setCoinz(n);
+              }}
+              keyboardType="number-pad"
+              placeholder={`0-${maxCoinz}`}
+              placeholderTextColor={theme.dim}
+              style={styles.coinzInput}
+            />
+            <Text style={styles.coinzHint}>max {maxCoinz} · 1 = ₪{d.coinValue ?? 1}</Text>
+          </View>
+        )}
       </View>
 
       {props.busy && (
@@ -445,6 +467,21 @@ const styles = StyleSheet.create({
   inStock: { color: theme.ok, fontSize: 12, fontWeight: '700' },
   limit: { color: theme.dim, fontSize: 11.5 },
   limitNote: { color: theme.dim, fontSize: 11, marginTop: 6 },
+  coinzRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 12 },
+  coinzLabel: { color: theme.text, fontSize: 13, fontWeight: '700' },
+  coinzInput: {
+    width: 90,
+    backgroundColor: theme.card,
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    color: theme.text,
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  coinzHint: { color: theme.dim, fontSize: 11 },
   loading: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 14 },
   hint: { color: theme.dim, fontSize: 11, marginTop: 6 },
   error: { color: theme.bad, fontSize: 12, marginTop: 10 },

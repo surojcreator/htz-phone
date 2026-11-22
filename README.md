@@ -14,6 +14,10 @@ Verify      → two independent app-API sessions + web profile + stale-number hu
 |---|---|
 | **Set phone** | email / password / new phone → writes the phone, then re-logs in and shows a before/after table with a field diff |
 | **Verify** | read-only sweep; prints PASS / FAIL / INFO per surface |
+| **חנוכה** | bulk order loop with retries, rate-limit handling and a card link |
+| **Shop** | native storefront: home feed, categories, search + history, sort/filter, favourites, recently viewed, product gallery, models, stock, reviews, similar products, share/copy, quick add. Cart writes go through `addToCart` on the Android API |
+| **Cart** | add any product (regular or quick cart), change quantities, remove lines, pick delivery, check the wallet balance and pay the whole cart from it |
+| **Defaults** | stored phones / order defaults |
 
 ## How it talks to the service
 
@@ -22,6 +26,16 @@ Verify      → two independent app-API sessions + web profile + stale-number hu
 ```
 loginUser            POST { email, password }   ← both SecureEncryption-encrypted
 editUserInformation  POST { phone }             ← merges; only the phone moves
+getItems             POST { categoryId }        ← native catalogue feed
+getItem              POST { itemId, itemType }  ← native product page + items_collected
+searchQuery          POST { q }                 ← native search
+getPopularSearches   POST {}                    ← trending terms
+getItemMoreProducts  POST { itemId }            ← similar products
+getItemComments      POST { itemId }            ← rating + reviews
+addToCart            POST { itemId, itemType, isQuick, collectedIds }
+getCart              POST {}                    ← native cart
+removeFromCart       POST { itemKey }            ← native line removal
+getUserWallet        POST {}                    ← wallet balance
 ```
 
 The credentials must be encrypted exactly like the native client does, or the

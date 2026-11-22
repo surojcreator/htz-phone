@@ -1,69 +1,44 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback } from 'react';
 
-import { clearCredentials, loadCredentials, saveCredentials } from '../core/storage';
+import { useAccounts } from './accounts';
 
 export type RememberState = 'idle' | 'saved' | 'cleared' | 'unavailable';
 
 /**
- * Email/password state shared by both screens, restored from the secure store
- * on mount and written back after a successful action.
+ * Thin adapter over the account list.
+ *
+ * Screens were built around this hook; it now reads the *active* account, so
+ * switching accounts in Settings or the header changes what every screen uses
+ * without any per-screen plumbing. `setEmail` / `setPassword` edit the active
+ * account in place.
  */
 export function useCredentials() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [remember, setRemember] = useState(true);
-  const [loaded, setLoaded] = useState(false);
-  const [rememberState, setRememberState] = useState<RememberState>('idle');
+  const { active, loaded, update, touch } = useAccounts();
 
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const saved = await loadCredentials();
-      if (!alive) return;
-      if (saved) {
-        setEmail(saved.email);
-        setPassword(saved.password);
-        setRemember(true);
-        setRememberState('saved');
-      }
-      setLoaded(true);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  /** Call after a successful run. */
-  const persist = useCallback(
-    async (e: string, p: string) => {
-      if (!remember) {
-        await clearCredentials();
-        setRememberState('cleared');
-        return;
-      }
-      const ok = await saveCredentials({ email: e.trim(), password: p });
-      setRememberState(ok ? 'saved' : 'unavailable');
-    },
-    [remember],
-  );
+  const persist = useCallback(async () => {
+    if (active) await touch(active.id);
+  }, [active, touch]);
 
   const forget = useCallback(async () => {
-    await clearCredentials();
-    setPassword('');
-    setRememberState('cleared');
-  }, []);
+    if (active) await update(active.id, { password: '' });
+  }, [active, update]);
 
   return {
-    email,
-    setEmail,
-    password,
-    setPassword,
-    remember,
-    setRemember,
+    email: active?.email ?? '',
+    setEmail: (v: string) => {
+      if (active) void update(active.id, { email: v });
+    },
+    password: active?.password ?? '',
+    setPassword: (v: string) => {
+      if (active) void update(active.id, { password: v });
+    },
+    remember: true,
+    setRemember: (_: boolean) => {},
     loaded,
     persist,
     forget,
-    rememberState,
+    rememberState: (active ? 'saved' : 'idle') as RememberState,
+    hasAccount: !!active,
   };
 }
 

@@ -204,6 +204,14 @@ export class HtzClient {
     s.webAt = 0;
   }
 
+  /** Drop only the Android-API cookies, keeping the web session intact. */
+  resetAppSession(): void {
+    const s = this.sess;
+    for (const k of Object.keys(s.jar)) {
+      if (k.startsWith('api.htzone.co.il|') || k.startsWith('cms.htzone.co.il|')) delete s.jar[k];
+    }
+  }
+
   private static hostOf(url: string): string {
     try {
       return new URL(url).host;
@@ -831,6 +839,249 @@ export class HtzClient {
       throw new Error(`app login failed: ${msg}${hint}`);
     }
     return res.data as User;
+  }
+
+  /**
+   * Any Android-API method. `loginUser` encrypts its payload; the rest take
+   * plain JSON and rely on the session cookie `loginUser` sets.
+   */
+  private async appRequest(method: string, payload: unknown = {}): Promise<any> {
+    let res: any = null;
+    let lastErr: any = null;
+    for (const host of APP_HOSTS) {
+      try {
+        res = await this.postJson(`${host}${method}/`, payload);
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    if (!res) throw new Error(`app ${method} unreachable: ${lastErr?.message ?? 'no host answered'}`);
+    if (res?.status !== 1) {
+      const err = res?.err ?? {};
+      const e = new Error(String(err?.content || `app ${method} failed`)) as Error & {
+        code?: number;
+        extra?: string;
+        raw?: any;
+      };
+      e.code = typeof err?.id === 'number' ? err.id : undefined;
+      // The store puts the real reason in `extra` (e.g. `no credit`).
+      e.extra = typeof err?.extra === 'string' ? err.extra : undefined;
+      e.raw = res?.err ?? res;
+      throw e;
+    }
+    return res.data;
+  }
+
+  /**
+   * Wallet balance from the Android API (`getUserWallet`).
+   *
+   * Mirror of the APK's `GetUserWalletResponse.parseResponseData`: it reads
+   * `total`, `more.ObligoList` and `more.ObligoListInfo`. The first is the
+   * spendable balance; `ObligoList` is a per-key rollup (`{ ALL: 0 }`) and
+   * `ObligoListInfo` are the rows the wallet screen lists. Treating the rollup
+   * as a list is what made an empty wallet report "1 obligo line".
+   */
+  async appWallet(): Promise<{
+    total: number;
+    /** rows shown in הארנק שלי */
+    obligo: any[];
+    info: any[];
+    /** the raw `ObligoList` rollup, e.g. `{ ALL: 0 }` */
+    byKey: Record<string, number>;
+  }> {
+    const parse = (d: any) => {
+      const more = d?.more ?? {};
+      const list = more?.ObligoList ?? d?.ObligoList ?? {};
+      const rawInfo = more?.ObligoListInfo ?? d?.ObligoListInfo ?? [];
+
+      const byKey: Record<string, number> = {};
+      if (Array.isArray(list)) {
+        for (const row of list) {
+          const key = String(row?.key ?? row?.title ?? '').trim();
+          if (key) byKey[key] = Number(row?.sum ?? row?.value ?? 0) || 0;
+        }
+      } else {
+        for (const [key, value] of Object.entries(list || {})) byKey[key] = Number(value) || 0;
+      }
+
+      const info = Array.isArray(rawInfo) ? rawInfo : Object.values(rawInfo || {});
+      return {
+        total: Number(d?.total ?? d?.balance ?? 0) || 0,
+        obligo: info,
+        info,
+        byKey,
+      };
+    };
+
+    const read = () => this.appRequest('getUserWallet', {});
+    try {
+      return parse(await read());
+    } catch (e: any) {
+      // 150 = "must be logged in": the app session cookie is missing or stale
+      if (e?.code === 150) {
+        await this.appLogin();
+        return parse(await read());
+      }
+      throw e;
+    }
+  }
+
+  /** Home feed (`categoryId: 0`) or a category — native catalogue. */
+  async appItems(params: Record<string, any> = { categoryId: 0 }): Promise<any> {
+    return this.appRequest('getItems', params);
+  }
+
+  /** Native search. Response is `{ res: [...], categories: ... }`. */
+  async appSearch(params: { q: string; isPage?: number | boolean }): Promise<any> {
+    return this.appRequest('searchQuery', params);
+  }
+
+  /**
+   * Authenticated Android-API call: retries once after `loginUser` when the
+   * session cookie is missing or stale (error id 150).
+   */
+  private async appAuthedRequest(method: string, payload: unknown = {}): Promise<any> {
+    try {
+      return await this.appRequest(method, payload);
+    } catch (e: any) {
+      if (e?.code === 150) {
+        await this.appLogin();
+        return this.appRequest(method, payload);
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * Add to the cart through the Android API (the official app path).
+   *
+   * `collectedIds` is the native shape for a chosen SKU:
+   * `[{ id: <collected option id>, quantity }]`.
+   */
+  async appAddToCart(params: {
+    itemId: number;
+    itemType?: number;
+    isQuick?: number;
+    collectedIds?: { id: number; quantity: number }[];
+    featureArr?: any;
+    color?: any;
+  }): Promise<any> {
+    // The official AddToCartRequest runs collectedIds through setCollectedIds:
+    //   [{ id, quantity }] -> { "0": { collectedId, quantity } }
+    // Sending the raw array is ignored by the store.
+    let collected: Record<string, { collectedId: number; quantity: number }> | undefined;
+    if (params.collectedIds) {
+      collected = {};
+      params.collectedIds.forEach((v, i) => {
+        collected![String(i)] = { collectedId: v.id, quantity: v.quantity };
+      });
+    }
+    return this.appAuthedRequest('addToCart', {
+      itemId: params.itemId,
+      itemType: params.itemType ?? 1,
+      isQuick: params.isQuick ?? 0,
+      ...(collected !== undefined ? { collectedIds: collected } : {}),
+      ...(params.featureArr !== undefined ? { featureArr: params.featureArr } : {}),
+      ...(params.color !== undefined ? { color: params.color } : {}),
+    });
+  }
+
+  /** Native cart read (the authoritative cart for API-added items). */
+  async appGetCart(): Promise<any> {
+    return this.appAuthedRequest('getCart', {});
+  }
+
+  /**
+   * The app's “בצע הזמנה”: submit the native cart.
+   *
+   * `obligoSum` is the wallet amount to spend (the APK's `htzMoneyAmount`,
+   * sent as `data.obligo_sum`). With no card and no credit the store answers
+   * `152 אופס.. פרמטר חסר` and `extra: "no credit"` — that string is the whole
+   * difference between "the order needs a card" and "something is broken".
+   */
+  async appSubmitOrder(
+    params: {
+      obligoSum?: number;
+      isQuick?: 0 | 1;
+      creditCardId?: string;
+      numberOfPayments?: number;
+      phone?: string;
+      isMandatoryCreditCard?: boolean;
+    } = {},
+  ): Promise<{ ok: boolean; orderId?: number; error?: string; extra?: string; raw?: any }> {
+    const body = {
+      creditCardId: params.creditCardId ?? '',
+      isQuick: params.isQuick ?? 0,
+      data: {
+        is_mandatory_credit_card: params.isMandatoryCreditCard ? 1 : 0,
+        address: '',
+        address_id: '',
+        numberOfPayments: params.numberOfPayments ?? 1,
+        obligo_sum: params.obligoSum ?? 0,
+        ...(params.phone ? { phone: params.phone } : {}),
+      },
+    };
+    try {
+      const data = await this.appAuthedRequest('submitOrder', body);
+      const orderId =
+        Number(data?.order_id ?? data?.orderId ?? data?.order?.id ?? data?.id ?? 0) || undefined;
+      return { ok: true, orderId, raw: data };
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e), extra: e?.extra, raw: e?.raw };
+    }
+  }
+
+  /** Native line removal, keyed by the cart's `item_key`. */
+  async appRemoveFromCart(itemKey: string): Promise<any> {
+    return this.appAuthedRequest('removeFromCart', { itemKey });
+  }
+
+  /** Native product page. `itemType` is 1 for regular catalogue products. */
+  async appItem(params: { itemId: number; itemType?: number }): Promise<any> {
+    return this.appRequest('getItem', { itemType: 1, ...params });
+  }
+
+  /** Similar products shown under a product page. */
+  async appMoreProducts(params: { itemId: number; itemType?: number }): Promise<any> {
+    return this.appRequest('getItemMoreProducts', { itemType: 1, ...params });
+  }
+
+  /** Trending search terms. */
+  async appPopularSearches(): Promise<any> {
+    return this.appRequest('getPopularSearches', {});
+  }
+
+  /** Rating + review list for a product. */
+  async appComments(params: { itemId: number; itemType?: number }): Promise<any> {
+    return this.appRequest('getItemComments', { itemType: 1, ...params });
+  }
+
+  /**
+   * App → web single sign-on, exactly like the APK's `LetMeIn.php` deeplink.
+   *
+   * The redirect chain sets the website session cookie on an intermediate 3xx,
+   * so the hops are followed manually and cookies are absorbed at each hop.
+   */
+  async webSso(authcode: string, target = '/'): Promise<string> {
+    let url = `${WEB}/LetMeIn.php?authcode=${encodeURIComponent(authcode)}&target=${encodeURIComponent(target)}`;
+    for (let hop = 0; hop < 8; hop++) {
+      const headers: Record<string, string> = { Accept: 'text/html,application/xhtml+xml' };
+      const cookie = this.cookieHeaderFor(url);
+      if (cookie) headers.Cookie = cookie;
+      const res = await withTimeout(
+        fetch(url, { headers, redirect: 'manual', credentials: 'omit' }),
+        25000,
+      );
+      this.absorb(res, url);
+      const loc = res.headers.get('location');
+      if (res.status >= 300 && res.status < 400 && loc) {
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      return await res.text();
+    }
+    throw new Error('SSO redirect loop');
   }
 
   /** Raw web GET through the same session (cookies included). */

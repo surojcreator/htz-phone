@@ -21,17 +21,32 @@ export type ProductRef = {
   kind: 'quick' | 'regular';
   id: number;
   title: string;
-  variants: { id: number; price: number; label: string; max?: number }[];
+  /** member / card price of the cheapest in-stock model */
+  price?: number;
+  fullPrice?: number;
+  image?: string;
+  description?: string;
+  /** the PDP's own wording for the purchase cap, e.g. "עד-4 שוברים בחודש" */
+  limitNote?: string;
+  variants: { id: number; price: number; label: string; max?: number; stock?: number; inStock?: boolean }[];
+  /** the PDP's own per-order cap, used when a variant row carries no max */
+  maxPurchase?: number;
   addressRequired: boolean;
 };
 
 export type CartLine = {
+  /** opaque cart key the store uses to update/remove a line */
+  key: string;
   itemId: number;
   variantId: number | null;
   qty: number;
   price: number;
   title: string;
+  /** set when the store refuses the line (sold out / sale ended) */
+  invalid?: string;
 };
+
+export type CartWarning = { message: string };
 
 export type DeliveryOption = {
   supplierId: number;
@@ -45,7 +60,10 @@ export type DeliveryOption = {
 
 export type CartSummary = {
   kind: string;
+  /** bumped by the store on every mutation; send it back or get 409 */
+  version: number;
   lines: CartLine[];
+  warnings: string[];
   units: number;
   total: number;
   addressRequired: boolean;
@@ -83,27 +101,88 @@ export function parseProductRef(input: string): { kind: 'quick' | 'regular'; id:
   return null;
 }
 
+/**
+ * The flight payload escapes some labels one level too many
+ * (`"תו קניה \\\"…\\\""`), which makes the whole array unparseable. Collapsing the
+ * doubled backslashes restores valid JSON without touching anything else.
+ */
+function repairEscapes(slice: string): string {
+  return slice.replace(/\\\\"/g, '\\"');
+}
+
+/** Balanced array → rows, tolerating both strict JSON and the broken escaping. */
+function parseOptions(slice: string): any[] | null {
+  for (const candidate of [slice, repairEscapes(slice)]) {
+    try {
+      const arr = JSON.parse(candidate);
+      if (Array.isArray(arr)) return arr;
+    } catch {
+      /* try the repaired form / loose parser */
+    }
+  }
+  const loose = looseOptions(repairEscapes(slice));
+  return loose && loose.length ? loose : null;
+}
+
+/** Repair rows whose labels are double-escaped, so JSON.parse rejects them. */
+function looseOptions(slice: string): any[] | null {
+  const inner = slice.trim().replace(/^\[/, '').replace(/\]$/, '');
+  if (!inner) return null;
+  const chunks = inner.split(/\},\s*\{/);
+  const out: any[] = [];
+  for (const chunk of chunks) {
+    const s = chunk.startsWith('{') ? chunk : '{' + chunk;
+    const id = s.match(/"id"\s*:\s*(\d+)/);
+    if (!id) continue;
+    const str = (key: string) => {
+      const m = s.match(new RegExp('"' + key + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"'));
+      return m ? m[1].replace(/\\(["\\])/g, '$1') : undefined;
+    };
+    const num = (key: string) => {
+      const m = s.match(new RegExp('"' + key + '"\\s*:\\s*(\\d+)'));
+      return m ? Number(m[1]) : undefined;
+    };
+    const o: any = { id: Number(id[1]) };
+    const label = str('label') ?? str('desc') ?? str('title') ?? str('text');
+    if (label !== undefined) {
+      o.label = label;
+      o.desc = label;
+    }
+    for (const k of ['price', 'statusPrice', 'maxPerOrder', 'maxQty', 'available']) {
+      const v = num(k);
+      if (v !== undefined) o[k] = v;
+    }
+    if (/"inStock"\s*:\s*true/.test(s)) o.inStock = true;
+    else if (/"inStock"\s*:\s*false/.test(s)) o.inStock = false;
+    out.push(o);
+  }
+  return out.length ? out : null;
+}
+
 /** Pull the balanced JSON array that follows `key` out of the flight payload. */
 function arrayAfter(flat: string, key: string): any[] | null {
-  const at = flat.indexOf(key);
-  if (at < 0) return null;
-  const start = flat.indexOf('[', at + key.length);
-  if (start < 0) return null;
-  let depth = 0;
-  for (let i = start; i < flat.length && i < start + 40000; i++) {
-    const ch = flat[i];
-    if (ch === '[') depth++;
-    else if (ch === ']') {
-      depth--;
-      if (depth === 0) {
-        try {
-          const arr = JSON.parse(flat.slice(start, i + 1));
-          return Array.isArray(arr) ? arr : null;
-        } catch {
-          return null;
+  let at = flat.indexOf(key);
+  while (at >= 0) {
+    // The value must actually be an array. Pages repeat the key (often first as
+    // `"$undefined"` and later as the real rows), so scan every occurrence.
+    let start = at + key.length;
+    while (start < flat.length && /\s/.test(flat[start])) start++;
+    if (flat[start] === '[') {
+      let depth = 0;
+      for (let i = start; i < flat.length && i < start + 40000; i++) {
+        const ch = flat[i];
+        if (ch === '[') depth++;
+        else if (ch === ']') {
+          depth--;
+          if (depth === 0) {
+            const parsed = parseOptions(flat.slice(start, i + 1));
+            if (parsed) return parsed;
+            break;
+          }
         }
       }
     }
+    at = flat.indexOf(key, at + key.length);
   }
   return null;
 }
@@ -112,32 +191,64 @@ export function parseProductPage(ref: { kind: 'quick' | 'regular'; id: number },
   const flat = html.replace(/\\"/g, '"');
   const variants: ProductRef['variants'] = [];
 
-  for (const key of ['"priceOptions":', '"variants":']) {
+  // `collectedOptions` are the concrete SKUs (e.g. colour/handset variants).
+  // The website makes you pick one and sends its id as `variant_id`; a product
+  // added without it is dropped from the cart as unavailable.
+  for (const key of ['"priceOptions":', '"collectedOptions":', '"variants":']) {
     const arr = arrayAfter(flat, key);
     if (!arr) continue;
     for (const v of arr) {
       const id = Number(v.id ?? v.variantId ?? 0);
       if (!id || variants.some((x) => x.id === id)) continue;
+      const label = String(v.label ?? v.desc ?? v.title ?? v.text ?? '');
+      const price = Number(v.statusPrice ?? v.price ?? v.htzCard ?? 0);
+      if (!label && !price) continue;
       variants.push({
         id,
-        price: Number(v.statusPrice ?? v.price ?? 0),
-        label: String(v.desc ?? v.title ?? v.text ?? ''),
-        max: v.maxPerOrder != null ? Number(v.maxPerOrder) : v.max != null ? Number(v.max) : undefined,
+        price,
+        label,
+        max: v.maxPerOrder != null ? Number(v.maxPerOrder) : v.max != null ? Number(v.max) : v.maxQty != null ? Number(v.maxQty) : v.available != null ? Number(v.available) : undefined,
+        inStock: v.inStock === undefined ? undefined : v.inStock !== false,
       });
     }
     if (variants.length) break;
   }
 
   const title =
-    (html.match(/"title":"([^"]{2,120})"/) || [])[1] ||
+    (flat.match(/"seo":\{"title":"((?:\\.|[^"\\]){2,160})"/) || [])[1] ||
+    (flat.match(/"title":"((?:\\.|[^"\\]){2,120})"/) || [])[1] ||
     (html.match(/<title[^>]*>([\s\S]{0,120}?)<\/title>/i) || [])[1]?.trim() ||
     String(ref.id);
+
+  // `maxPurchase` is the PDP-level cap; it is the only max some products expose.
+  const maxPurchase = Number((flat.match(/"maxPurchase"\s*:\s*(\d+)/) || [])[1] ?? 0) || undefined;
+  for (const v of variants) {
+    if (v.max == null && maxPurchase) v.max = maxPurchase;
+  }
+
+  const priced = variants.filter((v) => v.price > 0).map((v) => v.price);
+  const image =
+    (flat.match(/"ogImage":"([^"]+)"/) || [])[1] ||
+    (flat.match(/"main_media[^"]*":"(https?:[^"]+)"/) || [])[1] ||
+    (html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) || [])[1] ||
+    '';
+  const description = ((flat.match(/"seo":\{[^}]*"description":"((?:\\.|[^"\\])*)"/) || [])[1] || '')
+    .replace(/\\(["\\])/g, '$1')
+    .replace(/^\u2026|\.\.\./, '')
+    .trim();
+  const limitNote = ((flat.match(/"purchaseLimitNote":"((?:\\.|[^"\\])*)"/) || [])[1] || '').replace(/\\(["\\])/g, '$1');
 
   return {
     kind: ref.kind,
     id: ref.id,
-    title,
+    title: title.replace(/\\(["\\])/g, '$1').trim(),
+    price: priced.length ? Math.min(...priced) : undefined,
+    fullPrice: Number((flat.match(/"fullPrice"\s*:\s*(\d+)/) || [])[1] ?? 0) || undefined,
+    image,
+    description,
+    limitNote,
     variants,
+    maxPurchase,
     addressRequired: /"addressRequired":true/.test(flat),
   };
 }
@@ -150,34 +261,144 @@ export async function readProduct(client: HtzClient, input: string): Promise<Pro
   return parseProductPage(ref, html);
 }
 
+/**
+ * Read the models from the PDP the app actually uses (`/webview/<id>`), with the
+ * legacy item page as a fallback. This is what makes products with colour/SKU
+ * options resolvable before adding (otherwise the store answers "choose a model").
+ */
+export async function readProductWebview(
+  client: HtzClient,
+  input: string | number,
+  kind?: 'quick' | 'regular',
+): Promise<ProductRef> {
+  const s = String(input);
+  const parsed = parseProductRef(s);
+  const id = parsed?.id ?? Number(s);
+  if (!id) throw new Error('could not read a product id');
+  const k = kind ?? parsed?.kind ?? 'regular';
+  const html = await client.webGet(`/webview/${id}`);
+  const first = parseProductPage({ kind: k, id }, html);
+  if (first.variants.length) return first;
+  const path = k === 'quick' ? `/wallet_attraction_item/${id}` : `/item/${id}/`;
+  const alt = await client.webGet(path);
+  return parseProductPage({ kind: k, id }, alt);
+}
+
+export type AddResult = {
+  ok: boolean;
+  error?: string;
+  /** store error code (`purchase_limit_reached`, `variant_required`, …) */
+  code?: string;
+  /** per-order cap the store reported with the refusal */
+  limit?: number;
+  remaining?: number;
+};
+
+function addFailure(res: { status: number; json: any }): AddResult {
+  const e = res?.json?.error;
+  return {
+    ok: false,
+    code: e?.code,
+    limit: e?.details?.limit != null ? Number(e.details.limit) : undefined,
+    remaining: e?.details?.remaining != null ? Number(e.details.remaining) : undefined,
+    error: HtzClient.apiError(res),
+  };
+}
+
+/** Hebrew wording for a refusal, so the UI never shows a raw API code. */
+export function addErrorText(res: AddResult): string {
+  if (res.code === 'purchase_limit_reached') {
+    return res.limit
+      ? `הגעת למכסת הרכישה של מוצר זה (${res.limit})`
+      : 'הגעת למכסת הרכישה של מוצר זה';
+  }
+  if (res.code === 'variant_required') return 'יש לבחור דגם לפני ההוספה לסל';
+  if (res.code === 'out_of_stock' || res.code === 'sold_out') return 'המוצר אזל מהמלאי';
+  if (res.code === 'sale_ended') return 'המכירה הסתיימה';
+  return res.error ?? 'ההוספה לסל נכשלה';
+}
+
 export async function addToCart(
   client: HtzClient,
-  opts: { kind: 'quick' | 'regular'; id: number; qty: number; variantId?: number },
-): Promise<{ ok: boolean; error?: string }> {
-  const body: Record<string, any> = {
-    kind: opts.kind,
-    product_id: opts.id,
-    quantity: opts.qty,
-    ...(opts.variantId ? { variant_id: opts.variantId } : {}),
-  };
-  const res = await client.webApi('POST', '/api/cart/items', body);
-  if (res.status === 422) {
-    const code = res.json?.error?.code;
-    const det = res.json?.error?.details || {};
-    if (code === 'variant_required') {
-      return { ok: false, error: 'this product needs a model — pick a variant id and add again' };
-    }
-    if (code === 'purchase_limit_reached') {
-      return {
-        ok: false,
-        error: `purchase limit reached for this product (limit ${det.limit ?? '?'}, remaining ${det.remaining ?? 0})`,
+  opts: { kind: 'quick' | 'regular'; id: number; qty: number; variantId?: number; itemType?: number },
+): Promise<AddResult> {
+  const webAdd = async (): Promise<AddResult> => {
+    try {
+      await client.ensureWebSession();
+      const body = {
+        kind: opts.kind,
+        product_id: opts.id,
+        quantity: opts.qty,
+        ...(opts.variantId ? { variant_id: opts.variantId } : {}),
       };
+      const res = await client.webApi('POST', '/api/cart/items', body);
+      if (res.status < 400 && !res.json?.error) return { ok: true };
+
+      // The store asks for a model before adding. Resolve it from the PDP and
+      // retry once instead of surfacing "יש לבחור דגם".
+      if (res.json?.error?.code === 'variant_required' && !opts.variantId) {
+        try {
+          const ref = await readProductWebview(client, opts.id, opts.kind);
+          const pick = ref.variants.find((v) => v.inStock !== false)?.id;
+          if (pick) {
+            const retry = await client.webApi('POST', '/api/cart/items', { ...body, variant_id: pick });
+            if (retry.status < 400 && !retry.json?.error) return { ok: true };
+            return addFailure(retry);
+          }
+        } catch {
+          /* report the original error */
+        }
+      }
+
+      return addFailure(res);
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) };
     }
-    if (code === 'cart_empty') return { ok: false, error: 'the cart is empty' };
+  };
+
+  try {
+    const collected = opts.variantId ? [{ id: opts.variantId, quantity: opts.qty }] : undefined;
+    const data = await client.appAddToCart({
+      itemId: opts.id,
+      itemType: opts.itemType ?? 1,
+      isQuick: opts.kind === 'quick' ? 1 : 0,
+      ...(collected ? { collectedIds: collected } : {}),
+    });
+    const popup = data?.popupObject;
+    if (popup && typeof popup === 'object' && Object.keys(popup).length > 0) {
+      // Items the native cart wants extra validation for can usually be added
+      // through the website cart.
+      return await webAdd();
+    }
+    const extra = data?.required_additional_fields;
+    if (extra && typeof extra === 'object' && Object.keys(extra).length > 0) {
+      return await webAdd();
+    }
+    return { ok: true };
+  } catch (e: any) {
+    // Native add rejects webview-only / lead-style items. Try the website cart
+    // before reporting "cannot purchase".
+    const native = e?.message ?? String(e);
+    const web = await webAdd();
+    return web.ok ? web : { ...web, error: web.error || native };
   }
-  if (res.status >= 400 || res.json?.error) return { ok: false, error: HtzClient.apiError(res) };
-  return { ok: true };
 }
+
+const num = (v: unknown): number => {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  const n = Number(String(v ?? '').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+};
+
+const pick = (o: any, ...keys: string[]): any => {
+  for (const k of keys) if (o?.[k] !== undefined && o?.[k] !== null) return o[k];
+  return undefined;
+};
+
+const text = (v: unknown): string => (v === null || v === undefined ? '' : String(v)).trim();
+
+const asList = (v: unknown): any[] =>
+  Array.isArray(v) ? v : v && typeof v === 'object' ? Object.values(v as Record<string, any>) : [];
 
 export async function readCart(client: HtzClient, kind: 'quick' | 'regular'): Promise<CartSummary> {
   const res = await client.webApi('GET', `/api/cart?kind=${kind}`);
@@ -187,29 +408,296 @@ export async function readCart(client: HtzClient, kind: 'quick' | 'regular'): Pr
   for (const sup of (d.checkout?.suppliers || []) as any[]) {
     for (const o of (sup.deliveryOptions || sup.delivery?.options || []) as any[]) {
       deliveries.push({
-        supplierId: Number(sup.supplierId),
-        id: Number(o.id),
+        supplierId: num(pick(sup, 'supplierId', 'supplier_id')),
+        id: num(o.id),
         label: String(o.label ?? ''),
-        price: Number(o.price ?? 0),
-        usesAddress: !!o.usesAddress,
-        needsPoint: !!o.needsPoint,
+        price: num(o.price),
+        usesAddress: !!pick(o, 'usesAddress', 'uses_address'),
+        needsPoint: !!pick(o, 'needsPoint', 'needs_point'),
         type: String(o.type ?? ''),
       });
     }
   }
   return {
     kind: cartKind,
-    lines: (d.lines || []).map((l: any) => ({
-      itemId: Number(l.itemId),
-      variantId: l.variantId != null ? Number(l.variantId) : null,
-      qty: Number(l.qty ?? 0),
-      price: Number(l.price ?? 0),
-      title: String(l.title ?? ''),
+    version: num(pick(d, 'version', 'cartVersion', 'cart_version')),
+    lines: ((d.lines || []) as any[]).map((l) => ({
+      key: String(pick(l, 'key', 'lineKey', 'line_key', 'itemKey', 'item_key', 'id') ?? ''),
+      itemId: num(pick(l, 'itemId', 'item_id', 'product_id')),
+      variantId: pick(l, 'variantId', 'variant_id') != null ? num(pick(l, 'variantId', 'variant_id')) : null,
+      qty: num(pick(l, 'qty', 'quantity', 'totalItems', 'total_items')),
+      price: num(pick(l, 'price', 'itemPrice', 'item_price')),
+      title: String(pick(l, 'title', 'itemTitle', 'item_title') ?? ''),
+      invalid:
+        text(pick(l, 'invalid_message', 'invalidMessage', 'invalid_reason', 'removed_message', 'removedReason')) ||
+        undefined,
     })),
-    units: Number(d.checkout?.units ?? d.count ?? 0),
-    total: Number(d.total || d.checkout?.totalSum || 0),
-    addressRequired: !!d.checkout?.addressRequired,
+    units: num(pick(d.checkout, 'units') ?? pick(d, 'count', 'count_items', 'total_items')),
+    total: num(d.total || d.checkout?.totalSum || d.checkout?.total_sum),
+    addressRequired: !!(d.checkout?.addressRequired ?? d.checkout?.address_required),
+    warnings: [d.warnings, d.notices, d.messages, d.removed_items, d.removedItems]
+      .flatMap(asList)
+      .map((w) => (typeof w === 'string' ? w : text(w?.message ?? w?.text ?? w?.title ?? w?.reason)))
+      .filter(Boolean),
     deliveries,
+  };
+}
+
+/** The native cart, normalized to the shape the screens already use. */
+export async function readNativeCart(client: HtzClient): Promise<CartSummary> {
+  const data = await client.appGetCart();
+  const lines: CartLine[] = asList(data?.itemsArr)
+    .map((l) => ({
+      key: text(pick(l, 'item_key', 'itemKey', 'id')),
+      itemId: num(pick(l, 'item_id', 'itemId')),
+      variantId:
+        pick(l, 'item_collected_id', 'collected_id', 'itemCollectedId') != null
+          ? num(pick(l, 'item_collected_id', 'collected_id', 'itemCollectedId'))
+          : null,
+      qty: num(pick(l, 'total_items', 'totalItems', 'quantity')),
+      price: num(pick(l, 'item_price', 'itemPrice', 'price')),
+      title: text(pick(l, 'item_title', 'itemTitle', 'title')),
+      invalid: text(pick(l, 'invalid_message', 'invalidMessage')) || undefined,
+    }))
+    .filter((l) => l.itemId > 0);
+
+  return {
+    kind: 'regular',
+    version: 0,
+    lines,
+    warnings: [],
+    units: num(pick(data, 'total_items', 'totalItems')),
+    total: num(pick(data, 'total')),
+    addressRequired: false,
+    deliveries: [],
+  };
+}
+
+/** Merge lines that only exist in the Android cart into the web view. */
+export function mergeCarts(
+  web: CartSummary | null,
+  native: CartSummary | null,
+): CartSummary | null {
+  if (!web) return native;
+  if (!native) return web;
+  const keyOf = (l: CartLine) => `${l.itemId}:${l.variantId ?? ''}`;
+  const seen = new Set(web.lines.map(keyOf));
+  const extra = native.lines.filter((l) => !seen.has(keyOf(l)));
+  if (!extra.length) return web;
+  return {
+    ...web,
+    lines: [...web.lines, ...extra],
+    units: web.units + extra.reduce((s, l) => s + l.qty, 0),
+    total: web.total + extra.reduce((s, l) => s + l.price * l.qty, 0),
+  };
+}
+
+/**
+ * Confirm the store kept the line after a native add.
+ *
+ * The Android cart is authoritative for API-added items; the web cart is a
+ * second opinion. Either may carry the store's `invalid_message`.
+ */
+export async function verifyAddedItem(
+  client: HtzClient,
+  kind: 'quick' | 'regular',
+  itemId: number,
+  variantId?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const matches = (l: CartLine) =>
+    l.itemId === itemId && (variantId == null ? true : l.variantId == null || l.variantId === variantId);
+
+  let readable = false;
+  let sawLines = false;
+
+  try {
+    const native = await readNativeCart(client);
+    readable = true;
+    sawLines = sawLines || native.lines.length > 0;
+    const line = native.lines.find(matches);
+    if (line) return line.invalid ? { ok: false, error: line.invalid } : { ok: true };
+  } catch {
+    /* fall through to the web cart */
+  }
+
+  try {
+    const web = await readCart(client, kind);
+    readable = true;
+    sawLines = sawLines || web.lines.length > 0;
+    const line = web.lines.find(matches);
+    if (line) return line.invalid ? { ok: false, error: line.invalid } : { ok: true };
+    if (web.warnings.length) return { ok: false, error: web.warnings[0] };
+  } catch {
+    /* unreadable cart */
+  }
+
+  // Nothing readable is not proof of failure: the add call itself succeeded.
+  if (!readable || !sawLines) return { ok: true };
+
+  return { ok: false, error: 'the store did not keep this item (sale ended or out of stock)' };
+}
+
+/**
+ * Cart mutations carry the version from the last cart read; the store answers
+ * 409 `cart_version_conflict` when another tab moved first. Retrying once with
+ * the version it reports is what the website itself does.
+ */
+async function cartWrite(
+  client: HtzClient,
+  method: 'POST' | 'PUT' | 'DELETE',
+  path: string,
+  body: Record<string, any>,
+  version?: number,
+): Promise<{ status: number; json: any }> {
+  const send = (v?: number) => client.webApi(method, path, { ...body, ...(v ? { version: v } : {}) });
+  let res = await send(version);
+  if (res.status === 409 && res.json?.error?.code === 'cart_version_conflict') {
+    const current = num(pick(res.json?.error?.details, 'current_version', 'currentVersion'));
+    res = await send(current || version);
+  }
+  return res;
+}
+
+function cartError(res: { status: number; json: any }): string {
+  const code = res.json?.error?.code;
+  const det = res.json?.error?.details || {};
+  if (code === 'variant_required') return 'this product needs a model — pick a variant id and add again';
+  if (code === 'purchase_limit_reached')
+    return `purchase limit reached (limit ${det.limit ?? '?'}, remaining ${det.remaining ?? 0})`;
+  if (code === 'cart_empty') return 'the cart is empty';
+  if (code === 'cart_version_conflict') return 'the cart changed elsewhere — reload and try again';
+  return HtzClient.apiError(res);
+}
+
+/** Change the quantity of an existing line (0 removes it). */
+export async function setCartQty(
+  client: HtzClient,
+  kind: 'quick' | 'regular',
+  line: { key: string; itemId: number; variantId: number | null; qty?: number; itemType?: number },
+  qty: number,
+  version?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = line.key
+    ? await cartWrite(client, 'POST', '/api/cart/quantity', { kind, item_key: line.key, quantity: qty }, version)
+    : await cartWrite(
+        client,
+        'PUT',
+        '/api/cart/items',
+        { kind, product_id: line.itemId, quantity: qty, ...(line.variantId ? { variant_id: line.variantId } : {}) },
+        version,
+      );
+  if (res.status < 400 && !res.json?.error) return { ok: true };
+
+  // The line may live only in the Android cart: remove it and add the new qty.
+  if (line.key) {
+    try {
+      await client.appRemoveFromCart(line.key);
+      const collected = line.variantId ? [{ id: line.variantId, quantity: qty }] : undefined;
+      await client.appAddToCart({
+        itemId: line.itemId,
+        itemType: line.itemType ?? 1,
+        isQuick: kind === 'quick' ? 1 : 0,
+        ...(collected ? { collectedIds: collected } : {}),
+      });
+      return { ok: true };
+    } catch (e: any) {
+      // Try to put the previous quantity back rather than losing the line.
+      try {
+        const collected = line.variantId ? [{ id: line.variantId, quantity: line.qty ?? 1 }] : undefined;
+        await client.appAddToCart({
+          itemId: line.itemId,
+          itemType: line.itemType ?? 1,
+          isQuick: kind === 'quick' ? 1 : 0,
+          ...(collected ? { collectedIds: collected } : {}),
+        });
+      } catch {
+        /* nothing else to try */
+      }
+      return { ok: false, error: e?.message ?? String(e) };
+    }
+  }
+
+  return { ok: false, error: cartError(res) };
+}
+
+/** Drop a line entirely. */
+export async function removeCartLine(
+  client: HtzClient,
+  kind: 'quick' | 'regular',
+  line: { key: string; itemId: number; variantId: number | null },
+  version?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!line.key) {
+    return { ok: false, error: 'this line has no cart key — reload the cart and try again' };
+  }
+  // Native first: lines added through the Android API live there.
+  try {
+    await client.appRemoveFromCart(line.key);
+    return { ok: true };
+  } catch {
+    /* not a native line — fall back to the web cart */
+  }
+  const res = await cartWrite(
+    client,
+    'DELETE',
+    `/api/cart/items?key=${encodeURIComponent(line.key)}`,
+    { kind },
+    version,
+  );
+  if (res.status >= 400 || res.json?.error) return { ok: false, error: cartError(res) };
+  return { ok: true };
+}
+
+/** Wallet balance straight from the Android API (`getUserWallet`). */
+export async function readWallet(
+  client: HtzClient,
+): Promise<{ ok: boolean; total: number; obligo: any[]; error?: string }> {
+  try {
+    const data = await client.appWallet();
+    return { ok: true, total: data.total, obligo: data.obligo };
+  } catch (e: any) {
+    return { ok: false, total: 0, obligo: [], error: e?.message ?? String(e) };
+  }
+}
+
+export type NativeCheckoutResult = {
+  ok: boolean;
+  orderId?: number;
+  /** wallet amount sent as `obligo_sum` */
+  walletUsed?: number;
+  code?: 'no_credit' | 'limit' | 'other';
+  error?: string;
+};
+
+/**
+ * "בצע הזמנה" — checkout the native cart (the app's own submit).
+ *
+ * The APK sends `data.obligo_sum` = how much of הארנק שלי to spend, so the
+ * balance is applied before any card. With no card and no credit the store
+ * answers `152 אופס.. פרמטר חסר` with `extra: "no credit"` — that is the
+ * card-required signal, not a malformed request.
+ */
+export async function checkoutNativeCart(
+  client: HtzClient,
+  opts: { phone: string; obligoSum?: number; isQuick?: 0 | 1; numberOfPayments?: number },
+): Promise<NativeCheckoutResult> {
+  const wallet = await client.appWallet().catch(() => null);
+  const obligoSum = opts.obligoSum ?? wallet?.total ?? 0;
+  const res = await client.appSubmitOrder({
+    obligoSum,
+    isQuick: opts.isQuick ?? 0,
+    phone: opts.phone,
+    numberOfPayments: opts.numberOfPayments ?? 1,
+  });
+  if (res.ok) return { ok: true, orderId: res.orderId, walletUsed: obligoSum };
+
+  // Report the store's own wording verbatim — the app shows exactly this, and
+  // replacing it hides which condition the store actually hit.
+  return {
+    ok: false,
+    code: String(res.extra ?? '') === 'no credit' ? 'no_credit' : /limit|מכס|מלאי|אזל/i.test(String(res.error)) ? 'limit' : 'other',
+    walletUsed: 0,
+    error: res.error ?? 'אופס.. פרמטר חסר',
   };
 }
 
@@ -218,14 +706,22 @@ export async function setDelivery(
   client: HtzClient,
   kind: 'quick' | 'regular',
   selections: { supplier_id: number; delivery_link_id: number }[],
+  version?: number,
 ): Promise<{ ok: boolean; error?: string }> {
-  const res = await client.webApi('POST', '/api/cart/delivery', { kind, selections });
-  if (res.status >= 400 || res.json?.error) return { ok: false, error: HtzClient.apiError(res) };
+  const res = await cartWrite(client, 'POST', '/api/cart/delivery', { kind, selections }, version);
+  if (res.status >= 400 || res.json?.error) return { ok: false, error: cartError(res) };
   return { ok: true };
 }
 
-export async function clearCart(client: HtzClient, kind: 'quick' | 'regular'): Promise<void> {
-  await client.webApi('DELETE', `/api/cart?kind=${kind}`);
+export async function clearCart(client: HtzClient, kind: 'quick' | 'regular', version?: number): Promise<void> {
+  await cartWrite(client, 'DELETE', `/api/cart?kind=${kind}`, {}, version);
+  // Also clear lines that only exist in the Android cart.
+  try {
+    const native = await readNativeCart(client);
+    for (const line of native.lines) await client.appRemoveFromCart(line.key).catch(() => {});
+  } catch {
+    /* nothing native to clear */
+  }
 }
 
 /**
@@ -244,10 +740,11 @@ export async function payFromWallet(
     email: string;
     address?: { address: string; city: string };
     delivery?: { supplier_id: number; delivery_link_id: number }[];
+    version?: number;
   },
 ): Promise<WalletPayResult> {
   if (opts.delivery && opts.delivery.length) {
-    const set = await setDelivery(client, opts.kind, opts.delivery);
+    const set = await setDelivery(client, opts.kind, opts.delivery, opts.version);
     if (!set.ok) return { ok: false, error: 'delivery: ' + (set.error || 'rejected') };
   }
 

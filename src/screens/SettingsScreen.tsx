@@ -4,14 +4,22 @@ import { Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-nat
 import { checkPhone, checkQty } from '../core/format';
 import { HtzClient } from '../core/api';
 import { BUILT_IN, RUN_MODES } from '../core/defaults';
+import { clearHistory } from '../core/history';
 import { theme } from '../ui/theme';
+import { useAccounts } from '../ui/accounts';
 import { useCreds } from '../ui/credentials';
 import { useDefaults } from '../ui/defaults';
-import { Field } from './SetPhoneScreen';
+import { Field } from '../ui/Field';
 
 export default function SettingsScreen() {
   const { defaults, loaded, patch, reset, savedAt } = useDefaults();
   const creds = useCreds();
+  const { accounts, activeId, add, remove, setActive, update, loaded: accountsLoaded } = useAccounts();
+
+  const [newLabel, setNewLabel] = useState('');
+  const [newEmail, setNewEmail] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [accountNotice, setAccountNotice] = useState('');
 
   const [phone, setPhone] = useState(defaults.phone);
   const [orderPhone, setOrderPhone] = useState(defaults.orderPhone);
@@ -107,6 +115,19 @@ export default function SettingsScreen() {
 
   const mark = () => setTouched(true);
 
+  async function addAccount() {
+    const email = newEmail.trim();
+    if (!email || !newPassword) {
+      setAccountNotice('email and password are both required');
+      return;
+    }
+    await add(email, newPassword, newLabel.trim() || email);
+    setNewLabel('');
+    setNewEmail('');
+    setNewPassword('');
+    setAccountNotice('account added and activated');
+  }
+
   async function resetSession() {
     const email = creds.email.trim();
     if (!email) {
@@ -119,10 +140,43 @@ export default function SettingsScreen() {
 
   return (
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-      <Text style={styles.h1}>Defaults</Text>
+      <Text style={styles.h1}>Settings</Text>
       <Text style={styles.sub}>
-        Every value the app starts with. Changing one here changes it everywhere — no rebuild.
+        Accounts, defaults and the advanced knobs. Order screens use whichever account is selected at the top.
       </Text>
+
+      <Text style={[styles.label, { marginTop: 20 }]}>Saved accounts</Text>
+      {accountsLoaded && accounts.length === 0 && (
+        <Text style={styles.notice}>No accounts yet — add the first one below.</Text>
+      )}
+      {accounts.map((a) => (
+        <View key={a.id} style={[styles.accountRow, a.id === activeId && styles.accountRowActive]}>
+          <Pressable style={{ flex: 1 }} onPress={() => void setActive(a.id)}>
+            <Text style={[styles.accountName, a.id === activeId && { color: theme.accent }]} numberOfLines={1}>
+              {a.id === activeId ? '● ' : '○ '}{a.label}
+            </Text>
+            <Text style={styles.accountMeta} numberOfLines={1}>
+              {a.email}
+              {a.phone ? ` · ${a.phone}` : ''}
+              {a.lastUsedAt ? ` · used ${new Date(a.lastUsedAt).toLocaleDateString()}` : ''}
+            </Text>
+          </Pressable>
+          <Pressable onPress={() => void remove(a.id)} hitSlop={8} style={styles.accountAction}>
+            <Text style={styles.accountActionText}>remove</Text>
+          </Pressable>
+        </View>
+      ))}
+
+      <Field label="Label" value={newLabel} onChange={setNewLabel} placeholder="e.g. work account" />
+      <Field label="Email" value={newEmail} onChange={setNewEmail} keyboard="email-address" placeholder="name@company.co.il" />
+      <Field label="Password" value={newPassword} onChange={setNewPassword} secure placeholder="account password" />
+      <Pressable onPress={addAccount} style={({ pressed }) => [styles.ghost, { marginTop: 12, paddingVertical: 12 }, pressed && { opacity: 0.85 }]}>
+        <Text style={styles.ghostText}>Add account</Text>
+      </Pressable>
+      {!!accountNotice && <Text style={styles.notice}>{accountNotice}</Text>}
+
+      <View style={styles.divider} />
+      <Text style={styles.label}>Defaults</Text>
 
       <Field
         label="Account phone (Set phone target)"
@@ -262,16 +316,18 @@ export default function SettingsScreen() {
       </Text>
 
       <View style={styles.divider} />
-      <Text style={styles.label}>Session</Text>
-      <Text style={[styles.notice, { marginTop: 4 }]}>
-        Drops the stored website session and mints a new one on the next request. This is what
-        reinstalling the app used to do — use it when login starts failing.
-      </Text>
+      <Text style={styles.label}>Maintenance</Text>
       <Pressable
         onPress={resetSession}
         style={({ pressed }) => [styles.ghost, { marginTop: 10, paddingVertical: 12 }, pressed && { opacity: 0.85 }]}
       >
         <Text style={styles.ghostText}>Reset session</Text>
+      </Pressable>
+      <Pressable
+        onPress={() => void clearHistory().then(() => setNotice('history cleared'))}
+        style={({ pressed }) => [styles.ghost, { marginTop: 8, paddingVertical: 12 }, pressed && { opacity: 0.85 }]}
+      >
+        <Text style={styles.ghostText}>Clear history</Text>
       </Pressable>
     </ScrollView>
   );
@@ -328,4 +384,21 @@ const styles = StyleSheet.create({
   ghostText: { color: theme.dim, fontSize: 14, fontWeight: '700' },
   notice: { color: theme.dim, fontSize: 12, marginTop: 12 },
   divider: { height: StyleSheet.hairlineWidth, backgroundColor: theme.border, marginTop: 26, marginBottom: 18 },
+  accountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: theme.radius,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginTop: 8,
+    backgroundColor: theme.card,
+  },
+  accountRowActive: { borderColor: theme.accent, backgroundColor: theme.cardAlt },
+  accountName: { color: theme.text, fontSize: 13.5, fontWeight: '700' },
+  accountMeta: { color: theme.dim, fontSize: 11, marginTop: 2 },
+  accountAction: { borderColor: theme.border, borderWidth: 1, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4 },
+  accountActionText: { color: theme.bad, fontSize: 10.5, fontWeight: '700' },
 });

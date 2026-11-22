@@ -8,6 +8,10 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "check": "tsx scripts/check.ts",
+    "cart:selftest": "tsx scripts/cart_selftest.ts",
+    "catalog:check": "tsx scripts/catalog_check.ts",
+    "hanukka:selftest": "tsx scripts/hanukka_selftest.ts",
+    "hanukka:live": "tsx scripts/hanukka_live.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -16,7 +20,9 @@
     "expo": "~51.0.28",
     "expo-av": "~14.0.7",
     "expo-clipboard": "~6.0.3",
+    "expo-constants": "~16.0.2",
     "expo-crypto": "~13.0.2",
+    "expo-file-system": "~17.0.1",
     "expo-secure-store": "~13.0.2",
     "expo-status-bar": "~1.12.1",
     "react": "18.2.0",
